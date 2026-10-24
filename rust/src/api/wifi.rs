@@ -13,7 +13,7 @@ static BLE_MANAGER: Mutex<Option<PlatformBleManager>> = Mutex::new(None);
 // Speichert die IP des Peers (auf Client: GO-IP; auf GO: gelernte Client-IP)
 static PEER_IP: Mutex<Option<String>> = Mutex::new(None);
 static INCOMING_TCP_MSG: Mutex<Option<String>> = Mutex::new(None);
-// Ausgehende Nachrichten-Warteschlange (wird für GO -> Client über die vom Client offengehaltene/gepollt-aufgebaute TCP-Verbindung zugestellt, da Android 14+/VPN ausgehende GO-Sockets mit EACCES blockiert)
+// Ausgehende Nachrichten-Warteschlange (wird für GO -> Client über die vom Client aufgebaute TCP-Verbindung zugestellt, falls Firewall/EACCES direktes Connect blockiert)
 static OUTGOING_TCP_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static TCP_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static IS_CURRENTLY_GO: Mutex<bool> = Mutex::new(false);
@@ -29,7 +29,7 @@ pub fn init_core() -> Result<String, String> {
 
     ensure_tcp_server_running();
 
-    Ok("Rust Core (BLE + Wi-Fi + TCP :4242) initialisiert".into())
+    Ok("Rust Core (BLE + Wi-Fi Direct + TCP :4242) initialisiert".into())
 }
 
 pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, String> {
@@ -65,7 +65,7 @@ pub fn ble_scan(duration_secs: u64) -> Result<Vec<DiscoveredPeer>, String> {
     }
 }
 
-/// Auf dem GO: Prüft auf Paket 2 -> Startet Hotspot & TCP-Server -> Stellt Paket 3 (SSID;PSK;IP) bereit
+/// Auf dem GO: Prüft auf Paket 2 -> Startet Wi-Fi Direct GO (Autonomous Group) & TCP-Server -> Stellt Paket 3 (DIRECT-...;PSK;IP) bereit
 pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     let incoming = {
         let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -77,10 +77,13 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
         *IS_CURRENTLY_GO.lock().unwrap() = true;
         ensure_tcp_server_running();
 
+        // WICHTIG: Die SSID MUSS mit "DIRECT-" beginnen (gemäß Wi-Fi Direct Spezifikation),
+        // damit Androids WifiP2pConfig.Builder().setNetworkName(...) sie akzeptiert und über
+        // das P2P-Interface (p2p-wlan0-x) verbindet, ohne das normale Heim-WLAN (wlan0) zu trennen!
         let creds = {
             let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
             let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
-            w_mgr.start_hotspot("Rustle_Direct_GO".into(), "password1234".into())?
+            w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?
         };
 
         if creds.starts_with("ERR:") {
@@ -95,7 +98,7 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
         }
 
         return Ok(Some(format!(
-            "Anfrage '{}' -> Hotspot & TCP-Server (:4242) bereit! ({})",
+            "Anfrage '{}' -> Wi-Fi Direct GO & TCP-Server (:4242) bereit! ({})",
             req, creds
         )));
     }
@@ -103,7 +106,7 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Auf dem Client: Sendet Paket 2 -> Empfängt Paket 3 (SSID;PSK;IP) -> Verbindet Wi-Fi
+/// Auf dem Client: Sendet Paket 2 -> Empfängt Paket 3 (SSID;PSK;IP) -> Verbindet Wi-Fi Direct
 pub fn ble_handshake_and_join_wifi(
     target_address: String,
     client_name: String,
@@ -149,17 +152,11 @@ pub fn ble_handshake_and_join_wifi(
         return Err(wifi_res);
     }
 
-    // Sobald der Client verbunden ist, hält ein Hintergrund-Worker den Kontakt zum GO:
-    // 1. Er sendet den INIT_PING (damit der GO die Client-IP sieht)
-    // 2. Er fragt periodisch per "POLL" beim GO an, ob der GO eine Nachricht für den Client in der
-    //    Warteschlange hat. Dadurch funktioniert GO -> Client selbst dann zuverlässig, wenn auf
-    //    Android ein VPN aktiv ist oder Android 14+ ausgehende Sockets auf tethering/ap-Interfaces
-    //    mit EACCES (Permission denied) blockiert!
+    // Hintergrund-Worker für INIT_PING und Rückkanal-Polling (umgeht Firewall/EACCES für GO -> Client)
     let target = go_ip.clone();
     std::thread::spawn(move || {
         let mut init_done = false;
         loop {
-            // Breche ab, falls wir inzwischen selbst zum GO gewechselt sind oder eine andere GO-IP haben
             if *IS_CURRENTLY_GO.lock().unwrap() {
                 break;
             }
@@ -173,8 +170,7 @@ pub fn ble_handshake_and_join_wifi(
                 crate::platform::send_tcp_packet_platform(&target, RUSTLE_TCP_PORT, probe)
             {
                 init_done = true;
-                // Wenn der GO eine Nachricht für uns hatte, beginnt die Antwort mit "MSG:"
-                if let Some( idx ) = reply.find("MSG:") {
+                if let Some(idx) = reply.find("MSG:") {
                     let msg_content = reply[idx + 4..].trim().to_string();
                     if !msg_content.is_empty() {
                         println!("[RUST DEBUG] Vom GO über Poll empfangen: {}", msg_content);
@@ -214,9 +210,6 @@ pub fn send_test_packet(payload: String) -> Result<String, String> {
     match crate::platform::send_tcp_packet_platform(&target_ip, RUSTLE_TCP_PORT, &payload) {
         Ok(res) => Ok(res),
         Err(err) => {
-            // Falls wir GO sind und ein direktes ausgehendes TCP-Connect fehlschlägt (z.B. wegen
-            // Android EACCES auf ap/swlan-Interface bei aktivem VPN oder Linux-Client-Firewall),
-            // legen wir das Paket in die ausgehende Queue — der Client holt es innerhalb von <0.8s ab!
             if is_go {
                 println!(
                     "[RUST DEBUG] Direktes Senden vom GO blockiert ({}), stelle über Client-Rückkanal zu...",
@@ -224,7 +217,6 @@ pub fn send_test_packet(payload: String) -> Result<String, String> {
                 );
                 OUTGOING_TCP_QUEUE.lock().unwrap().push_back(payload.clone());
 
-                // Warte kurz (bis zu 2.5s), bis der Client die Nachricht beim nächsten Poll abgeholt hat
                 for _ in 0..25 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     if OUTGOING_TCP_QUEUE.lock().unwrap().is_empty() {

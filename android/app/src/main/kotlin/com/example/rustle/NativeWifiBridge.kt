@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
-import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -12,13 +11,12 @@ import android.net.NetworkRequest
 import android.net.wifi.ScanResult as WifiScanResult
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
-import android.net.wifi.WifiNetworkSuggestion
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
-import android.provider.Settings
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
@@ -31,11 +29,13 @@ import java.util.concurrent.TimeUnit
 @SuppressLint("MissingPermission")
 object NativeWifiBridge {
     private var appContext: Context? = null
-    private var currentActivity: android.app.Activity? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var advCallback: AdvertiseCallback? = null
     private var gattServer: BluetoothGattServer? = null
     private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
+
+    private var p2pManager: WifiP2pManager? = null
+    private var p2pChannel: WifiP2pManager.Channel? = null
 
     private var activeNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -60,16 +60,31 @@ object NativeWifiBridge {
     external fun initJni(context: Context)
 
     fun init(context: Context) {
-        if (context is android.app.Activity) {
-            currentActivity = context
-        }
         appContext = context.applicationContext
+        try {
+            p2pManager = appContext?.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+            p2pChannel = p2pManager?.initialize(appContext, Looper.getMainLooper(), null)
+        } catch (e: Throwable) {
+            println("WifiP2pManager Init Warnung: ${e.message}")
+        }
         try {
             System.loadLibrary("rust_lib_rustle")
             initJni(appContext!!)
         } catch (e: Throwable) {
             println("JNI Init Warnung: ${e.message}")
         }
+    }
+
+    private fun ensureP2pInitialized(ctx: Context): Pair<WifiP2pManager, WifiP2pManager.Channel>? {
+        if (p2pManager == null) {
+            p2pManager = ctx.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        }
+        val mgr = p2pManager ?: return null
+        if (p2pChannel == null) {
+            p2pChannel = mgr.initialize(ctx, Looper.getMainLooper(), null)
+        }
+        val ch = p2pChannel ?: return null
+        return Pair(mgr, ch)
     }
 
     @JvmStatic
@@ -366,31 +381,42 @@ object NativeWifiBridge {
         return result
     }
 
-    private fun resolveHotspotIp(excludeIps: Set<String> = emptySet()): String? {
+    private fun resolveHotspotIp(excludeIps: Set<String> = emptySet(), preferredInterface: String? = null): String? {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
-            for (intf in interfaces) {
-                if (!intf.isUp || intf.isLoopback) continue
-                val ips = intf.inetAddresses.toList().filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }
-                if (ips.isNotEmpty()) {
-                    println("Aktives Interface: ${intf.name} -> $ips")
+
+            // Falls der Interface-Name aus WifiP2pGroup bekannt ist (z.B. p2p-wlan0-0), prüfe diesen zuerst!
+            if (!preferredInterface.isNullOrEmpty()) {
+                val pIntf = interfaces.firstOrNull { it.name.equals(preferredInterface, ignoreCase = true) && it.isUp }
+                if (pIntf != null) {
+                    for (addr in pIntf.inetAddresses) {
+                        if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                            val ip = addr.hostAddress
+                            if (!ip.isNullOrEmpty()) {
+                                println("P2P-Interface (direkt via Group) gewählt: ${pIntf.name} -> IP: $ip")
+                                return ip
+                            }
+                        }
+                    }
                 }
             }
 
+            // Sortiere so, dass P2P-Interfaces (p2p*) und Hotspot-Interfaces (ap*, softap*, swlan*) vor wlan0 stehen
             val sorted = interfaces.sortedBy { intf ->
                 val n = intf.name.lowercase()
                 when {
-                    n.startsWith("ap") || n.startsWith("softap") || n.startsWith("swlan") -> 0
-                    n == "wlan2" || n == "wlan1" || n.startsWith("p2p") -> 1
-                    n.startsWith("wlan") -> 2
-                    else -> 3
+                    n.startsWith("p2p") -> 0
+                    n.startsWith("ap") || n.startsWith("softap") || n.startsWith("swlan") -> 1
+                    n == "wlan2" || n == "wlan1" -> 2
+                    n.startsWith("wlan") -> 3
+                    else -> 4
                 }
             }
 
             for (intf in sorted) {
                 if (!intf.isUp || intf.isLoopback) continue
                 val name = intf.name.lowercase()
-                if (!name.startsWith("wlan") && !name.startsWith("ap") && !name.startsWith("swlan") && !name.startsWith("softap") && !name.startsWith("p2p")) {
+                if (!name.startsWith("p2p") && !name.startsWith("wlan") && !name.startsWith("ap") && !name.startsWith("swlan") && !name.startsWith("softap")) {
                     continue
                 }
 
@@ -398,26 +424,14 @@ object NativeWifiBridge {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val ip = addr.hostAddress ?: continue
                         if (!excludeIps.contains(ip)) {
-                            println("Hotspot-Interface gewählt: $name -> IP: $ip")
+                            println("P2P/Hotspot-Interface gewählt: $name -> IP: $ip")
                             return ip
                         }
                     }
                 }
             }
-
-            for (intf in sorted) {
-                if (!intf.isUp || intf.isLoopback) continue
-                val name = intf.name.lowercase()
-                if (name.startsWith("ap") || name.startsWith("swlan") || name.startsWith("softap") || name == "wlan1" || name == "wlan2") {
-                    for (addr in intf.inetAddresses) {
-                        if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                            return addr.hostAddress
-                        }
-                    }
-                }
-            }
         } catch (e: Exception) {
-            println("Fehler beim Ermitteln der Hotspot-IP: ${e.message}")
+            println("Fehler beim Ermitteln der P2P/Hotspot-IP: ${e.message}")
         }
         return null
     }
@@ -448,18 +462,54 @@ object NativeWifiBridge {
         return null
     }
 
+    /**
+     * Startet auf Android einen echten Wi-Fi Direct Autonomous Group Owner via WifiP2pManager.createGroup()!
+     * Vorteil: Das normale Heim-WLAN (wlan0) bleibt dabei ungestört verbunden, während auf p2p-wlan0-x
+     * ein WPA2-GO (Standard-IP 192.168.49.1) aufgespannt wird.
+     * Falls P2P vom Gerät abgelehnt wird, greift automatisch LocalOnlyHotspot als Fallback.
+     */
     @JvmStatic
     fun startLocalHotspot(): String {
         val context = appContext ?: return "ERR: Kein Context"
-        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         activeWifiNetwork = null
         try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
 
         val existingClientIps = getActiveWifiClientIps()
-        println("startLocalHotspot: Ignoriere bestehende Heim-WLAN IPs: $existingClientIps")
 
+        // 1. Versuche echten Wi-Fi Direct Group Owner über WifiP2pManager.createGroup() zu starten
+        val p2pPair = ensureP2pInitialized(context)
+        if (p2pPair != null) {
+            val (mgr, ch) = p2pPair
+            val p2pFuture = CompletableFuture<String>()
+
+            // Eventuell bestehende alte P2P-Gruppe zuerst aufräumen, dann neue erstellen
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
+                }
+
+                override fun onFailure(reason: Int) {
+                    // Auch wenn keine Gruppe aktiv war (oder Fehler), jetzt neue erstellen
+                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
+                }
+            })
+
+            val p2pRes = try {
+                p2pFuture.get(12, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                "ERR: P2P Timeout"
+            }
+
+            if (!p2pRes.startsWith("ERR:")) {
+                return p2pRes
+            }
+            println("WifiP2pManager.createGroup Hinweis ($p2pRes) -> Falle zurück auf LocalOnlyHotspot...")
+        }
+
+        // 2. Fallback: LocalOnlyHotspot
+        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val future = CompletableFuture<String>()
 
         Handler(Looper.getMainLooper()).post {
@@ -491,7 +541,7 @@ object NativeWifiBridge {
                             }
                             val finalIp = ip ?: resolveHotspotIp(emptySet()) ?: "192.168.43.1"
                             currentHotspotIp = finalIp
-                            println("Hotspot bereit! SSID=$ssid, PSK=$psk, IP=$finalIp")
+                            println("LocalOnlyHotspot bereit! SSID=$ssid, PSK=$psk, IP=$finalIp")
                             future.complete("${ssid.removeSurrounding("\"")};$psk;$finalIp")
                         }.start()
                     }
@@ -512,25 +562,69 @@ object NativeWifiBridge {
         }
     }
 
-    /**
-     * Prüft, ob ein bestimmtes Android Network bereits eine IPv4 im 10.42.0.x (oder Ziel-Subnetz) hat.
-     */
-    private fun findConnectedLinuxGoNetwork(cm: ConnectivityManager): Network? {
-        for (net in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(net) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                val lp = cm.getLinkProperties(net) ?: continue
-                for (la in lp.linkAddresses) {
-                    val addr = la.address
-                    if (addr is Inet4Address && addr.hostAddress?.startsWith("10.42.") == true) {
-                        return net
+    private fun createP2pGroupInternal(
+        mgr: WifiP2pManager,
+        ch: WifiP2pManager.Channel,
+        existingClientIps: Set<String>,
+        future: CompletableFuture<String>
+    ) {
+        val createdListener = object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                // Gruppe wurde erstellt -> Frage nun SSID, Passphrase und Interface-Name ab
+                Thread {
+                    for (attempt in 1..20) {
+                        if (future.isDone) break
+                        Thread.sleep(300)
+                        mgr.requestGroupInfo(ch) { group ->
+                            if (group != null && !group.networkName.isNullOrEmpty() && !group.passphrase.isNullOrEmpty()) {
+                                val ssid = group.networkName.removeSurrounding("\"")
+                                val psk = group.passphrase
+                                val intfName = group.`interface`
+                                val ip = resolveHotspotIp(existingClientIps, intfName) ?: "192.168.49.1"
+                                currentHotspotIp = ip
+                                if (!future.isDone) {
+                                    println("Wi-Fi Direct GO bereit! SSID=$ssid, PSK=$psk, Interface=$intfName, IP=$ip (Heim-WLAN bleibt aktiv!)")
+                                    future.complete("$ssid;$psk;$ip")
+                                }
+                            }
+                        }
                     }
-                }
+                    if (!future.isDone) {
+                        future.complete("ERR: Konnte P2P GroupInfo nicht auslesen")
+                    }
+                }.start()
+            }
+
+            override fun onFailure(reason: Int) {
+                future.complete("ERR: createGroup fehlgeschlagen (Code $reason)")
             }
         }
-        return null
+
+        // Auf Android 10+ (API 29+) im 2.4-GHz-Band starten für maximale Kompatibilität & Geschwindigkeit
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val config = WifiP2pConfig.Builder()
+                    .setNetworkName("DIRECT-AndroidGO")
+                    .setPassphrase("password1234")
+                    .enablePersistentMode(false)
+                    .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+                    .build()
+                mgr.createGroup(ch, config, createdListener)
+                return
+            } catch (_: Exception) {
+            }
+        }
+        mgr.createGroup(ch, createdListener)
     }
 
+    /**
+     * Verbindet Android als Client mit dem GO:
+     * 1. Zuerst über echten Wi-Fi Direct (WifiP2pConfig.Builder mit SSID + Passphrase):
+     *    - Kein System-Dialog / Popup nötig!
+     *    - Verbindet über das dedizierte P2P-Interface (p2p-wlan0-x), sodass das normale Heim-WLAN (wlan0)
+     *      weiterhin mit dem Internet verbunden bleibt!
+     * 2. Falls das fehlschlägt (oder SSID nicht mit "DIRECT-" beginnt), Fallback auf WifiNetworkSpecifier.
+     */
     @JvmStatic
     fun connectToSpecifier(ssid: String, psk: String): String {
         val context = appContext ?: return "ERR: Kein Context"
@@ -539,15 +633,13 @@ object NativeWifiBridge {
 
         println("connectToSpecifier aufgerufen: SSID='$ssid', PSK='$psk'")
 
-        // Falls das Smartphone bereits mit dem Linux-Hotspot (10.42.0.x) verbunden ist, sofort fertig!
-        findConnectedLinuxGoNetwork(cm)?.let { existingNet ->
-            activeWifiNetwork = existingNet
-            cm.bindProcessToNetwork(existingNet)
-            println("Bereits mit Linux-GO Netzwerk ($existingNet) verbunden!")
-            return "Erfolgreich per Wi-Fi mit '$ssid' verbunden!"
+        // Falls wir bereits im Ziel-Subnetz (10.42.0.x oder 192.168.49.x) verbunden sind, sofort fertig!
+        if (findLocalIpInSameSubnet("10.42.0.1") != null || findLocalIpInSameSubnet("192.168.49.1") != null) {
+            println("Bereits über lokales P2P/Subnetz-Interface mit '$ssid' verbunden!")
+            return "Erfolgreich per Wi-Fi Direct mit '$ssid' verbunden (Heim-WLAN bleibt aktiv)!"
         }
 
-        // 1. Aktiv scannen, bis der Ziel-AP in der Android Scanliste erscheint
+        // 1. Warte kurz (bis zu 6s), bis der GO-AP im Wi-Fi Scan sichtbar ist
         var matchedScan: WifiScanResult? = null
         try {
             for (attempt in 1..6) {
@@ -560,21 +652,55 @@ object NativeWifiBridge {
                     rSsid == ssid
                 }
                 if (matchedScan != null) {
-                    println("Ziel-AP '$ssid' im Wi-Fi Scan gefunden (Versuch $attempt): BSSID=${matchedScan.BSSID}, Capabilities=${matchedScan.capabilities}, Freq=${matchedScan.frequency}")
+                    println("Ziel-GO '$ssid' im Scan gefunden (Versuch $attempt): BSSID=${matchedScan.BSSID}, Freq=${matchedScan.frequency}MHz, Caps=${matchedScan.capabilities}")
                     break
                 }
                 Thread.sleep(800)
             }
-        } catch (e: Exception) {
-            println("Warnung beim Vorab-Scan: ${e.message}")
+        } catch (_: Exception) {}
+
+        // 2. PRIMÄRER WEG (API 29+): Echte Wi-Fi Direct Verbindung via WifiP2pManager.connect(WifiP2pConfig)
+        //    Damit bleibt wlan0 im Heim-WLAN, und es erscheint KEIN nerviger System-Verbindungsdialog!
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ssid.startsWith("DIRECT-")) {
+            val p2pPair = ensureP2pInitialized(context)
+            if (p2pPair != null) {
+                val (mgr, ch) = p2pPair
+                val p2pFuture = CompletableFuture<String>()
+
+                mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        connectP2pWithConfig(mgr, ch, ssid, psk, matchedScan, p2pFuture)
+                    }
+
+                    override fun onFailure(reason: Int) {
+                        connectP2pWithConfig(mgr, ch, ssid, psk, matchedScan, p2pFuture)
+                    }
+                })
+
+                val p2pRes = try {
+                    p2pFuture.get(16, TimeUnit.SECONDS)
+                } catch (e: Exception) {
+                    "TIMEOUT"
+                }
+
+                if (p2pRes == "OK") {
+                    // WICHTIG: Bei P2P-Client ist activeWifiNetwork = null, damit sendTcpPacketOverWifi
+                    // den Socket direkt an die P2P-Interface-IP (10.42.0.x) bindet und wlan0 im Heim-WLAN lässt!
+                    activeWifiNetwork = null
+                    try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+                    return "Erfolgreich per Wi-Fi Direct mit '$ssid' verbunden (Heim-WLAN bleibt aktiv)!"
+                }
+                println("WifiP2pManager.connect lieferte '$p2pRes' -> Wechsle zu WifiNetworkSpecifier Fallback...")
+                mgr.cancelConnect(ch, null)
+            }
         }
 
+        // 3. FALLBACK: Reguläres WifiNetworkSpecifier (falls P2P-Interface nicht genutzt werden konnte)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             activeNetworkCallback?.let {
                 try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {}
             }
 
-            // Versuch A: WifiNetworkSpecifier OHNE setBssid (nur SSID + Passphrase, exakt wie ursprünglich)
             val specifier = WifiNetworkSpecifier.Builder()
                 .setSsid(ssid)
                 .setWpa2Passphrase(psk)
@@ -604,13 +730,12 @@ object NativeWifiBridge {
                             Thread.sleep(150)
                         }
                         if (!future.isDone) {
-                            future.complete("OK")
+                            future.complete("Erfolgreich per Wi-Fi mit '$ssid' verbunden!")
                         }
                     }.start()
                 }
 
                 override fun onLost(network: Network) {
-                    println("onLost: Netzwerk $network getrennt")
                     if (activeWifiNetwork == network) {
                         activeWifiNetwork = null
                         cm.bindProcessToNetwork(null)
@@ -618,9 +743,8 @@ object NativeWifiBridge {
                 }
 
                 override fun onUnavailable() {
-                    println("onUnavailable: WifiNetworkSpecifier nicht verfügbar")
                     if (!future.isDone) {
-                        future.complete("UNAVAILABLE")
+                        future.complete("ERR: Wi-Fi Verbindung abgelehnt oder nicht erreichbar")
                     }
                 }
             }
@@ -630,156 +754,111 @@ object NativeWifiBridge {
             try {
                 cm.requestNetwork(request, callback)
             } catch (e: Exception) {
-                future.complete("ERR: ${e.message}")
+                return "ERR: Konnte Wi-Fi Request nicht starten: ${e.message}"
             }
 
-            val specRes = try {
-                future.get(15, TimeUnit.SECONDS)
+            return try {
+                future.get(30, TimeUnit.SECONDS)
             } catch (e: Exception) {
-                "TIMEOUT"
+                "ERR: Wi-Fi Timeout: ${e.message}"
             }
-
-            if (specRes == "OK") {
-                return "Erfolgreich per Wi-Fi mit '$ssid' verbunden!"
-            }
-
-            // Versuch B (Fallback für Android 11–16, wenn WifiNetworkSpecifier wegen SAE/WPA2-Transition
-            // oder gecachtem Ablehnungs-Status sofort onUnavailable liefert):
-            // Wir übergeben das WLAN per WifiNetworkSuggestion + Settings.ACTION_WIFI_ADD_NETWORKS Dialog
-            // und lauschen auf das neue Wi-Fi-Netzwerk!
-            println("WifiNetworkSpecifier lieferte '$specRes' -> Nutze WifiNetworkSuggestion + System-Add-Network Fallback...")
-            try { cm.unregisterNetworkCallback(callback) } catch (_: Exception) {}
-
-            val fallbackFuture = CompletableFuture<String>()
-            val generalWifiReq = NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-
-            val generalCallback = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    Thread {
-                        for (i in 1..25) {
-                            val lp = cm.getLinkProperties(network)
-                            val ipv4 = lp?.linkAddresses?.mapNotNull { it.address as? Inet4Address }
-                                ?.firstOrNull { it.hostAddress?.startsWith("10.42.") == true }
-                            if (ipv4 != null) {
-                                println("Fallback Wi-Fi verbunden mit 10.42.x.x ($network -> $ipv4)!")
-                                activeWifiNetwork = network
-                                cm.bindProcessToNetwork(network)
-                                if (!fallbackFuture.isDone) {
-                                    fallbackFuture.complete("OK")
-                                }
-                                break
-                            }
-                            Thread.sleep(200)
-                        }
-                    }.start()
-                }
-            }
-
-            activeNetworkCallback = generalCallback
-            try {
-                cm.registerNetworkCallback(generalWifiReq, generalCallback)
-            } catch (_: Exception) {}
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                try {
-                    val sugWpa2 = WifiNetworkSuggestion.Builder()
-                        .setSsid(ssid)
-                        .setWpa2Passphrase(psk)
-                        .setIsAppInteractionRequired(false)
-                        .build()
-                    val sugWpa3 = WifiNetworkSuggestion.Builder()
-                        .setSsid(ssid)
-                        .setWpa3Passphrase(psk)
-                        .setIsAppInteractionRequired(false)
-                        .build()
-
-                    wifiManager.removeNetworkSuggestions(listOf(sugWpa2, sugWpa3))
-                    val status = wifiManager.addNetworkSuggestions(listOf(sugWpa2, sugWpa3))
-                    println("WifiNetworkSuggestions hinzugefügt (Status=$status)")
-
-                    // Öffne zusätzlich das offizielle Android-System-Popup zum Speichern & Verbinden des Netzwerks
-                    currentActivity?.let { act ->
-                        val bundle = Bundle().apply {
-                            putParcelableArrayList(
-                                Settings.EXTRA_WIFI_NETWORK_LIST,
-                                arrayListOf(sugWpa2)
-                            )
-                        }
-                        val intent = Intent(Settings.ACTION_WIFI_ADD_NETWORKS).apply {
-                            putExtras(bundle)
-                        }
-                        act.runOnUiThread {
-                            try {
-                                act.startActivityForResult(intent, 2002)
-                            } catch (e: Exception) {
-                                println("Konnte ACTION_WIFI_ADD_NETWORKS nicht starten: ${e.message}")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    println("Suggestion Fehler: ${e.message}")
-                }
-            }
-
-            // Prüfe bis zu 25 Sekunden, ob das Interface die 10.42.0.x IP erhält
-            for (i in 1..50) {
-                if (fallbackFuture.isDone) break
-                val net = findConnectedLinuxGoNetwork(cm)
-                if (net != null) {
-                    activeWifiNetwork = net
-                    cm.bindProcessToNetwork(net)
-                    fallbackFuture.complete("OK")
-                    break
-                }
-                if (findLocalIpInSameSubnet("10.42.0.1") != null) {
-                    fallbackFuture.complete("OK")
-                    break
-                }
-                Thread.sleep(500)
-            }
-
-            if (fallbackFuture.isDone && fallbackFuture.getNow("") == "OK") {
-                return "Erfolgreich per Wi-Fi mit '$ssid' verbunden!"
-            }
-
-            return "ERR: Wi-Fi Verbindung zu '$ssid' fehlgeschlagen ($specRes)"
         } else {
             return "ERR: Android < 10 nicht unterstützt"
         }
     }
 
+    @SuppressLint("NewApi")
+    private fun connectP2pWithConfig(
+        mgr: WifiP2pManager,
+        ch: WifiP2pManager.Channel,
+        ssid: String,
+        psk: String,
+        matchedScan: WifiScanResult?,
+        future: CompletableFuture<String>
+    ) {
+        try {
+            val builder = WifiP2pConfig.Builder()
+                .setNetworkName(ssid)
+                .setPassphrase(psk)
+                .enablePersistentMode(false)
+
+            if (matchedScan != null && matchedScan.frequency > 0) {
+                builder.setGroupOperatingFrequency(matchedScan.frequency)
+            } else {
+                builder.setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+            }
+
+            val config = builder.build()
+            println("Starte WifiP2pManager.connect zu '$ssid' (Freq=${matchedScan?.frequency ?: "2.4GHz"})...")
+
+            mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    println("WifiP2pManager.connect initiiert -> Warte auf DHCP-IP im Ziel-Subnetz...")
+                    Thread {
+                        for (i in 1..45) {
+                            if (future.isDone) break
+                            Thread.sleep(300)
+                            val localP2pIp = findLocalIpInSameSubnet("10.42.0.1")
+                                ?: findLocalIpInSameSubnet("192.168.49.1")
+                            if (localP2pIp != null) {
+                                currentHotspotIp = localP2pIp.hostAddress ?: ""
+                                println("Wi-Fi Direct Client verbunden! Lokale P2P-IP: ${localP2pIp.hostAddress}")
+                                future.complete("OK")
+                                break
+                            }
+                        }
+                        if (!future.isDone) {
+                            future.complete("DHCP_TIMEOUT")
+                        }
+                    }.start()
+                }
+
+                override fun onFailure(reason: Int) {
+                    println("WifiP2pManager.connect onFailure: Code $reason")
+                    if (!future.isDone) {
+                        future.complete("ERR_$reason")
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            println("connectP2pWithConfig Exception: ${e.message}")
+            if (!future.isDone) {
+                future.complete("EXC: ${e.message}")
+            }
+        }
+    }
+
     @JvmStatic
     fun sendTcpPacketOverWifi(targetIp: String, port: Int, message: String): String {
-        val ctx = appContext ?: return "ERR: Kein Context"
-        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-
         return try {
             val cleanIp = targetIp.trim()
             val targetInet = Inet4Address.getByName(cleanIp)
 
-            // Falls activeWifiNetwork leer ist, aber wir mit 10.42.0.x (Linux-GO) verbunden sind, hole das Network-Objekt
-            var clientNet = activeWifiNetwork
-            if (clientNet == null && cleanIp.startsWith("10.42.")) {
-                clientNet = findConnectedLinuxGoNetwork(cm)
-            }
+            // 1. Prüfe zuerst, ob wir ein lokales Interface (z.B. p2p-wlan0-0) im selben /24-Subnetz wie
+            //    die Ziel-IP (z.B. 10.42.0.1 oder 192.168.49.x) haben. Wenn ja, binden wir den Socket direkt
+            //    an diese lokale P2P-IPv4-Adresse! Dadurch läuft der Traffic garantiert über das P2P-Interface,
+            //    während das normale Heim-WLAN (wlan0) unangetastet bleibt!
+            val localSubnetAddr = findLocalIpInSameSubnet(cleanIp)
+            val clientNet = activeWifiNetwork
 
-            val socket: Socket = if (clientNet != null) {
-                println("TCP Senden (als Android-Client über Network $clientNet) an $cleanIp:$port")
+            val socket: Socket = if (localSubnetAddr != null && clientNet == null) {
+                Socket().also { rawSocket ->
+                    try {
+                        rawSocket.bind(InetSocketAddress(localSubnetAddr, 0))
+                    } catch (e: Exception) {
+                        println("Warnung: Konnte Socket nicht an P2P-IP $localSubnetAddr binden: ${e.message}")
+                    }
+                }
+            } else if (clientNet != null) {
                 clientNet.socketFactory.createSocket()
             } else {
                 Socket().also { rawSocket ->
-                    val localBindAddr = findLocalIpInSameSubnet(cleanIp)
+                    val fallbackBind = localSubnetAddr
                         ?: currentHotspotIp.takeIf { it.isNotEmpty() }?.let { Inet4Address.getByName(it) }
-                    println("TCP Senden (lokaler Bind=$localBindAddr) an $cleanIp:$port")
-                    if (localBindAddr != null) {
+                    if (fallbackBind != null) {
                         try {
-                            rawSocket.bind(InetSocketAddress(localBindAddr, 0))
-                        } catch (e: Exception) {
-                            println("Warnung: Konnte Socket nicht an $localBindAddr binden: ${e.message}")
-                        }
+                            rawSocket.bind(InetSocketAddress(fallbackBind, 0))
+                        } catch (_: Exception) {}
                     }
                 }
             }
@@ -797,7 +876,6 @@ object NativeWifiBridge {
             val reply = if (read > 0) String(buf, 0, read, Charsets.UTF_8) else "OK"
 
             socket.close()
-            println("TCP Senden erfolgreich! Antwort: $reply")
             "Erfolg: $reply"
         } catch (e: Throwable) {
             println("TCP Fehler Details: ${e.javaClass.simpleName}: ${e.message}")

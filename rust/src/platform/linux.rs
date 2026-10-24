@@ -33,12 +33,19 @@ impl WifiDirectDevice for WifiDirectManager {
     }
 
     fn start_hotspot(&mut self, ssid: String, psk: String) -> Result<String, String> {
+        // Erzwinge "DIRECT-" Präfix gemäß Wi-Fi Direct Spezifikation, damit Android WifiP2pManager
+        // sich über das P2P-Interface (p2p-wlan0-x) verbindet und das Heim-WLAN (wlan0) aktiv bleibt!
+        let direct_ssid = if ssid.starts_with("DIRECT-") {
+            ssid
+        } else {
+            format!("DIRECT-{}", ssid)
+        };
         async_std_or_tokio_block(async {
-            let ip = start_hotspot_internal(&ssid, &psk)
+            let ip = start_hotspot_internal(&direct_ssid, &psk)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!("[LINUX WIFI] Hotspot bereit: SSID={}, IP={}", ssid, ip);
-            Ok(format!("{};{};{}", ssid, psk, ip))
+            println!("[LINUX WIFI] Wi-Fi Direct GO bereit: SSID={}, IP={}", direct_ssid, ip);
+            Ok(format!("{};{};{}", direct_ssid, psk, ip))
         })
     }
 
@@ -110,15 +117,12 @@ async fn start_hotspot_internal(
         }
     }
 
-    // 3. Erzeuge das Hotspot-Profil von vornherein mit reinem WPA2-PSK (pmf=1 disable, key-mgmt=wpa-psk,
-    //    ohne SAE/WPA3-Transition und ohne PMF/SHA256-Mischbetrieb!), BEVOR es aktiviert wird.
-    //    Grund: `nmcli device wifi hotspot` aktiviert auf modernen Linux-Kerneln automatisch
-    //    `[RSN-PSK+PSK-SHA256+SAE-CCMP-128][MFPC]` (WPA2/WPA3 Mixed Mode), woraufhin Android 14+
-    //    `WifiNetworkSpecifier.setWpa2Passphrase` die Verbindung wegen Security-Type-Mismatch ablehnt!
+    // 3. Erzeuge das Wi-Fi Direct GO / Hotspot-Profil mit reinem WPA2-PSK (pmf=1 disable)
+    //    und connection.zone=trusted (damit firewalld auf Linux Port 4242 nicht blockiert!).
     if let Some(ref ifname) = wifi_ifname {
         println!(
-            "[LINUX WIFI] Erstelle reinen WPA2-Hotspot auf Interface '{}' via nmcli...",
-            ifname
+            "[LINUX WIFI] Erstelle Wi-Fi Direct GO ('{}') auf Interface '{}' via nmcli...",
+            ssid, ifname
         );
         let add_res = std::process::Command::new("nmcli")
             .args([
@@ -134,6 +138,8 @@ async fn start_hotspot_internal(
                 "no",
                 "ssid",
                 ssid,
+                "connection.zone",
+                "trusted",
                 "802-11-wireless.mode",
                 "ap",
                 "802-11-wireless.band",
@@ -151,7 +157,7 @@ async fn start_hotspot_internal(
                 "wifi-sec.group",
                 "ccmp",
                 "wifi-sec.pmf",
-                "1", // 1 = disable PMF (verhindert PSK-SHA256 + SAE Transition Mode in wpa_supplicant!)
+                "1", // 1 = disable PMF (reines WPA2-PSK für WifiP2pManager!)
                 "wifi-sec.wps-method",
                 "1", // 1 = disabled
             ])
@@ -191,6 +197,7 @@ async fn start_hotspot_internal(
     conn_settings.insert("id", Value::from("Rust_Hotspot"));
     conn_settings.insert("type", Value::from("802-11-wireless"));
     conn_settings.insert("autoconnect", Value::from(false));
+    conn_settings.insert("zone", Value::from("trusted"));
     settings.insert("connection", conn_settings);
 
     let mut wifi_settings: HashMap<&str, Value> = HashMap::new();
@@ -202,7 +209,7 @@ async fn start_hotspot_internal(
     let mut sec_settings: HashMap<&str, Value> = HashMap::new();
     sec_settings.insert("key-mgmt", Value::from("wpa-psk"));
     sec_settings.insert("psk", Value::from(psk));
-    sec_settings.insert("pmf", Value::from(1i32)); // PMF deaktivieren -> reines WPA2-PSK
+    sec_settings.insert("pmf", Value::from(1i32));
     settings.insert("802-11-wireless-security", sec_settings);
 
     let mut ip4_settings: HashMap<&str, Value> = HashMap::new();
@@ -246,6 +253,11 @@ async fn connect_to_hotspot_internal(
     ssid: &str,
     password: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Lösche eventuell vorhandene alte Verbindungsprofile mit gleicher SSID
+    let _ = std::process::Command::new("nmcli")
+        .args(["connection", "delete", ssid])
+        .output();
+
     let connection = Connection::system().await?;
 
     let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
@@ -253,6 +265,9 @@ async fn connect_to_hotspot_internal(
     let mut conn_settings: HashMap<&str, Value> = HashMap::new();
     conn_settings.insert("id", Value::from(ssid));
     conn_settings.insert("type", Value::from("802-11-wireless"));
+    // Setze Firewall-Zone auf "trusted", damit eingehende Pakete vom Android-GO auf Port 4242
+    // nicht von firewalld auf Linux verworfen werden!
+    conn_settings.insert("zone", Value::from("trusted"));
     settings.insert("connection", conn_settings);
 
     let mut wifi_settings: HashMap<&str, Value> = HashMap::new();
@@ -288,7 +303,7 @@ async fn connect_to_hotspot_internal(
         .await?;
 
     // Warte bis zu 12 Sekunden, bis das Interface per DHCP tatsächlich eine IPv4-Adresse
-    // vom Android-Hotspot erhalten hat!
+    // vom Android-GO (192.168.49.x bzw. 10.x.x.x) erhalten hat!
     for i in 1..=24 {
         std::thread::sleep(Duration::from_millis(500));
         if let Ok(ac_proxy) = zbus::Proxy::new(
