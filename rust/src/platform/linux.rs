@@ -7,14 +7,13 @@ use bluer::gatt::local::{
     Application, ApplicationHandle, Characteristic, CharacteristicRead, CharacteristicWrite,
     CharacteristicWriteMethod, Service,
 };
-use bluer::{Address, Uuid};
+use bluer::{Address, AddressType, Uuid};
 use std::collections::{BTreeSet, HashMap};
+use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zbus::{zvariant::Value, Connection};
-use std::io::{Read, Write};
-use std::net::TcpStream;
 
 pub struct WifiDirectManager;
 
@@ -35,11 +34,11 @@ impl WifiDirectDevice for WifiDirectManager {
 
     fn start_hotspot(&mut self, ssid: String, psk: String) -> Result<String, String> {
         async_std_or_tokio_block(async {
-            start_hotspot_internal(&ssid, &psk)
+            let ip = start_hotspot_internal(&ssid, &psk)
                 .await
                 .map_err(|e| e.to_string())?;
-            // NEU: Gibt "SSID;PSK;IP" zurück (NetworkManager Shared Standard-IP ist 10.42.0.1)
-            Ok(format!("{};{};10.42.0.1", ssid, psk))
+            println!("[LINUX WIFI] Hotspot bereit: SSID={}, IP={}", ssid, ip);
+            Ok(format!("{};{};{}", ssid, psk, ip))
         })
     }
 
@@ -59,7 +58,132 @@ where
     futures_lite::future::block_on(future)
 }
 
-async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Liest die lokale Hotspot-IP (z.B. 10.42.0.1) von den Linux-Netzwerkinterfaces aus,
+/// nachdem NetworkManager den Shared-AP gestartet hat.
+fn resolve_local_linux_hotspot_ip() -> Option<String> {
+    for _ in 0..25 {
+        if let Ok(output) = std::process::Command::new("ip")
+            .args(["-4", "-o", "addr", "show"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("10.42.") {
+                    for part in line.split_whitespace() {
+                        if part.starts_with("10.42.") {
+                            if let Some(ip) = part.split('/').next() {
+                                return Some(ip.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+async fn start_hotspot_internal(
+    ssid: &str,
+    psk: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // 1. Alten Hotspot wegräumen, falls noch ein Profil namens "Rust_Hotspot" existiert
+    let _ = std::process::Command::new("nmcli")
+        .args(["connection", "delete", "Rust_Hotspot"])
+        .output();
+
+    // 2. Ermittle das WLAN-Interface über nmcli (z.B. wlp11s0)
+    let mut wifi_ifname: Option<String> = None;
+    if let Ok(out) = std::process::Command::new("nmcli")
+        .args(["-t", "-f", "DEVICE,TYPE", "device"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Some((dev, dtype)) = line.split_once(':') {
+                if dtype.trim() == "wifi" && !dev.starts_with("p2p") {
+                    wifi_ifname = Some(dev.trim().to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Erzeuge das Hotspot-Profil von vornherein mit reinem WPA2-PSK (pmf=1 disable, key-mgmt=wpa-psk,
+    //    ohne SAE/WPA3-Transition und ohne PMF/SHA256-Mischbetrieb!), BEVOR es aktiviert wird.
+    //    Grund: `nmcli device wifi hotspot` aktiviert auf modernen Linux-Kerneln automatisch
+    //    `[RSN-PSK+PSK-SHA256+SAE-CCMP-128][MFPC]` (WPA2/WPA3 Mixed Mode), woraufhin Android 14+
+    //    `WifiNetworkSpecifier.setWpa2Passphrase` die Verbindung wegen Security-Type-Mismatch ablehnt!
+    if let Some(ref ifname) = wifi_ifname {
+        println!(
+            "[LINUX WIFI] Erstelle reinen WPA2-Hotspot auf Interface '{}' via nmcli...",
+            ifname
+        );
+        let add_res = std::process::Command::new("nmcli")
+            .args([
+                "connection",
+                "add",
+                "type",
+                "wifi",
+                "ifname",
+                ifname,
+                "con-name",
+                "Rust_Hotspot",
+                "autoconnect",
+                "no",
+                "ssid",
+                ssid,
+                "802-11-wireless.mode",
+                "ap",
+                "802-11-wireless.band",
+                "bg",
+                "ipv4.method",
+                "shared",
+                "wifi-sec.key-mgmt",
+                "wpa-psk",
+                "wifi-sec.psk",
+                psk,
+                "wifi-sec.proto",
+                "rsn",
+                "wifi-sec.pairwise",
+                "ccmp",
+                "wifi-sec.group",
+                "ccmp",
+                "wifi-sec.pmf",
+                "1", // 1 = disable PMF (verhindert PSK-SHA256 + SAE Transition Mode in wpa_supplicant!)
+                "wifi-sec.wps-method",
+                "1", // 1 = disabled
+            ])
+            .output();
+
+        if let Ok(output) = add_res {
+            if output.status.success() {
+                let up_res = std::process::Command::new("nmcli")
+                    .args(["connection", "up", "Rust_Hotspot"])
+                    .output();
+                if let Ok(up_out) = up_res {
+                    if up_out.status.success() {
+                        let ip = resolve_local_linux_hotspot_ip()
+                            .unwrap_or_else(|| "10.42.0.1".to_string());
+                        return Ok(ip);
+                    } else {
+                        println!(
+                            "[LINUX WIFI] nmcli up Warnung: {}",
+                            String::from_utf8_lossy(&up_out.stderr)
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "[LINUX WIFI] nmcli add Warnung: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    // 4. Fallback über D-Bus
     let connection = Connection::system().await?;
     let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
@@ -71,12 +195,14 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
 
     let mut wifi_settings: HashMap<&str, Value> = HashMap::new();
     wifi_settings.insert("mode", Value::from("ap"));
+    wifi_settings.insert("band", Value::from("bg"));
     wifi_settings.insert("ssid", Value::from(ssid.as_bytes().to_vec()));
     settings.insert("802-11-wireless", wifi_settings);
 
     let mut sec_settings: HashMap<&str, Value> = HashMap::new();
     sec_settings.insert("key-mgmt", Value::from("wpa-psk"));
     sec_settings.insert("psk", Value::from(psk));
+    sec_settings.insert("pmf", Value::from(1i32)); // PMF deaktivieren -> reines WPA2-PSK
     settings.insert("802-11-wireless-security", sec_settings);
 
     let mut ip4_settings: HashMap<&str, Value> = HashMap::new();
@@ -101,7 +227,7 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
     )
     .await?;
 
-    let active_path: zbus::zvariant::OwnedObjectPath = nm_proxy
+    let _active_path: zbus::zvariant::OwnedObjectPath = nm_proxy
         .call(
             "ActivateConnection",
             &(
@@ -112,7 +238,8 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
         )
         .await?;
 
-    Ok(format!("Hotspot aktiv: {:?}", active_path))
+    let ip = resolve_local_linux_hotspot_ip().unwrap_or_else(|| "10.42.0.1".to_string());
+    Ok(ip)
 }
 
 async fn connect_to_hotspot_internal(
@@ -120,6 +247,7 @@ async fn connect_to_hotspot_internal(
     password: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let connection = Connection::system().await?;
+
     let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
     let mut conn_settings: HashMap<&str, Value> = HashMap::new();
@@ -137,16 +265,6 @@ async fn connect_to_hotspot_internal(
     sec_settings.insert("psk", Value::from(password));
     settings.insert("802-11-wireless-security", sec_settings);
 
-    let proxy = zbus::Proxy::new(
-        &connection,
-        "org.freedesktop.NetworkManager",
-        "/org/freedesktop/NetworkManager/Settings",
-        "org.freedesktop.NetworkManager.Settings",
-    )
-    .await?;
-
-    let path: zbus::zvariant::OwnedObjectPath = proxy.call("AddConnection", &(settings)).await?;
-
     let nm_proxy = zbus::Proxy::new(
         &connection,
         "org.freedesktop.NetworkManager",
@@ -155,16 +273,43 @@ async fn connect_to_hotspot_internal(
     )
     .await?;
 
-    let active_path: zbus::zvariant::OwnedObjectPath = nm_proxy
+    let (_path, active_path): (
+        zbus::zvariant::OwnedObjectPath,
+        zbus::zvariant::OwnedObjectPath,
+    ) = nm_proxy
         .call(
-            "ActivateConnection",
+            "AddAndActivateConnection",
             &(
-                &path,
+                settings,
                 zbus::zvariant::ObjectPath::from_str_unchecked("/"),
                 zbus::zvariant::ObjectPath::from_str_unchecked("/"),
             ),
         )
         .await?;
+
+    // Warte bis zu 12 Sekunden, bis das Interface per DHCP tatsächlich eine IPv4-Adresse
+    // vom Android-Hotspot erhalten hat!
+    for i in 1..=24 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(ac_proxy) = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.NetworkManager",
+            active_path.as_str(),
+            "org.freedesktop.NetworkManager.Connection.Active",
+        )
+        .await
+        {
+            // State 2 == NM_ACTIVE_CONNECTION_STATE_ACTIVATED
+            if ac_proxy.get_property::<u32>("State").await.unwrap_or(0) == 2 {
+                println!(
+                    "[LINUX WIFI] Verbindung zu '{}' nach {}ms vollständig aktiviert (DHCP fertig)!",
+                    ssid,
+                    i * 500
+                );
+                break;
+            }
+        }
+    }
 
     Ok(format!("Mit '{}' verbunden ({:?})", ssid, active_path))
 }
@@ -238,7 +383,7 @@ impl BleDevice for LinuxBleManager {
                 ..Default::default()
             };
 
-            // Charakteristik 2: Ausgabefach für Paket 3 "SSID;PASSWORT" (Read)
+            // Charakteristik 2: Ausgabefach für Paket 3 "SSID;PASSWORT;IP" (Read)
             let ack_char = Characteristic {
                 uuid: Uuid::from_u128(RUSTLE_ACK_CHAR_UUID),
                 read: Some(CharacteristicRead {
@@ -246,7 +391,10 @@ impl BleDevice for LinuxBleManager {
                     fun: Box::new(move |_req| {
                         let creds = creds_clone.clone();
                         Box::pin(async move {
-                            let val = creds.lock().map(|c| c.as_bytes().to_vec()).unwrap_or_default();
+                            let val = creds
+                                .lock()
+                                .map(|c| c.as_bytes().to_vec())
+                                .unwrap_or_default();
                             Ok(val)
                         })
                     }),
@@ -267,7 +415,10 @@ impl BleDevice for LinuxBleManager {
                 ..Default::default()
             };
 
-            let app_h = adapter.serve_gatt_application(app).await.map_err(|e| e.to_string())?;
+            let app_h = adapter
+                .serve_gatt_application(app)
+                .await
+                .map_err(|e| e.to_string())?;
 
             let mut service_uuids = BTreeSet::new();
             service_uuids.insert(Uuid::from_u128(RUSTLE_SERVICE_UUID));
@@ -279,7 +430,10 @@ impl BleDevice for LinuxBleManager {
                 ..Default::default()
             };
 
-            let adv_h = adapter.advertise(le_advertisement).await.map_err(|e| e.to_string())?;
+            let adv_h = adapter
+                .advertise(le_advertisement)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok::<_, String>((adv_h, app_h))
         })?;
 
@@ -303,6 +457,12 @@ impl BleDevice for LinuxBleManager {
             let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
             adapter.set_powered(true).await.map_err(|e| e.to_string())?;
 
+            let filter = bluer::DiscoveryFilter {
+                transport: bluer::DiscoveryTransport::Le,
+                ..Default::default()
+            };
+            let _ = adapter.set_discovery_filter(filter).await;
+
             let _discover = adapter.discover_devices().await.map_err(|e| e.to_string())?;
             tokio::time::sleep(Duration::from_secs(duration_secs)).await;
 
@@ -311,6 +471,7 @@ impl BleDevice for LinuxBleManager {
 
             for addr in device_addresses {
                 if let Ok(dev) = adapter.device(addr) {
+                    let addr_type = dev.address_type().await.ok();
                     let name = dev.name().await.ok().flatten().unwrap_or_default();
                     let rssi = dev.rssi().await.ok().flatten().unwrap_or(0);
                     let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
@@ -318,11 +479,18 @@ impl BleDevice for LinuxBleManager {
                     let has_our_uuid = uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID));
                     let is_rustle_name = name.starts_with("R_GO_") || name.starts_with("R_CL_");
 
-                    if has_our_uuid || is_rustle_name || !name.is_empty() {
+                    if has_our_uuid
+                        || is_rustle_name
+                        || (!name.is_empty() && addr_type != Some(AddressType::BrEdr))
+                    {
                         let is_go = name.starts_with("R_GO_");
                         peers.push(DiscoveredPeer {
                             address: addr.to_string(),
-                            name: if name.is_empty() { "<Unbekannt>".into() } else { name },
+                            name: if name.is_empty() {
+                                "<Unbekannt>".into()
+                            } else {
+                                name
+                            },
                             is_go,
                             rssi,
                         });
@@ -338,22 +506,52 @@ impl BleDevice for LinuxBleManager {
         target_address: &str,
         client_name: &str,
     ) -> Result<String, String> {
-        let addr = Address::from_str(target_address).map_err(|e| format!("Ungültige MAC: {}", e))?;
+        let addr =
+            Address::from_str(target_address).map_err(|e| format!("Ungültige MAC: {}", e))?;
         let payload = format!("CONNECT;{}", client_name);
 
         self.rt.block_on(async move {
             let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
             let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
-            let device = adapter.device(addr).map_err(|e| e.to_string())?;
+            let mut device = adapter.device(addr).map_err(|e| e.to_string())?;
 
             if !device.is_connected().await.unwrap_or(false) {
-                device
-                    .connect()
-                    .await
-                    .map_err(|e| format!("BLE Connect fehlgeschlagen: {}", e))?;
+                if let Err(first_err) = device.connect().await {
+                    let err_msg = first_err.to_string();
+                    println!(
+                        "[LINUX BLE] Erster Connect-Versuch fehlgeschlagen ({}), bereinige BlueZ-Cache für {}...",
+                        err_msg, addr
+                    );
+                    let _ = adapter.remove_device(addr).await;
+
+                    let filter = bluer::DiscoveryFilter {
+                        transport: bluer::DiscoveryTransport::Le,
+                        ..Default::default()
+                    };
+                    let _ = adapter.set_discovery_filter(filter).await;
+
+                    if let Ok(_disc) = adapter.discover_devices().await {
+                        for _ in 0..15 {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            if let Ok(addrs) = adapter.device_addresses().await {
+                                if addrs.contains(&addr) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    device = adapter.device(addr).map_err(|e| e.to_string())?;
+                    device.connect().await.map_err(|e| {
+                        format!(
+                            "BLE Connect fehlgeschlagen (trotz LE-Cache-Reset nach '{}'): {}",
+                            err_msg, e
+                        )
+                    })?;
+                }
             }
 
-            for _ in 0..10 {
+            for _ in 0..15 {
                 if device.is_services_resolved().await.unwrap_or(false) {
                     break;
                 }
@@ -389,12 +587,13 @@ impl BleDevice for LinuxBleManager {
                 .await
                 .map_err(|e| format!("GATT Write Fehler: {}", e))?;
 
-            // 2. Auf Paket 3 (SSID;PASSWORT) warten (bis zu 15 Sekunden)
-            for _ in 0..30 {
+            // 2. Auf Paket 3 (SSID;PASSWORT;IP) warten (bis zu 25 Sekunden)
+            for _ in 0..50 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if let Ok(bytes) = ack_char.read().await {
                     if let Ok(creds) = String::from_utf8(bytes) {
                         if creds.contains(';') {
+                            println!("[LINUX BLE] Paket 3 empfangen: {}", creds);
                             let _ = device.disconnect().await;
                             return Ok(creds);
                         }
@@ -419,25 +618,71 @@ impl BleDevice for LinuxBleManager {
     }
 }
 
-pub fn send_tcp_packet_platform(target_ip: &str, port: u16, message: &str) -> Result<String, String> {
-        let addr = format!("{}:{}", target_ip, port);
-        let sock_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e| format!("Ungültige Zieladresse {}: {}", addr, e))?;
-
-        let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
-            .map_err(|e| format!("TCP-Connect zu {} fehlgeschlagen: {}", addr, e))?;
-
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        stream
-            .write_all(message.as_bytes())
-            .map_err(|e| format!("Senden fehlgeschlagen: {}", e))?;
-
-        let mut buf = [0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .map_err(|e| format!("Keine Antwort vom GO: {}", e))?;
-
-        let reply = String::from_utf8_lossy(&buf[..n]).to_string();
-        Ok(format!("Antwort vom GO: {}", reply))
+/// Findet die lokale IPv4-Adresse des Linux-Rechners, die im selben /24-Subnetz wie `target_ip` liegt.
+fn find_local_ipv4_in_same_subnet(target_ip: &str) -> Option<Ipv4Addr> {
+    let parts: Vec<&str> = target_ip.trim().split('.').collect();
+    if parts.len() != 4 {
+        return None;
     }
+    let prefix = format!("{}.{}.{}.", parts[0], parts[1], parts[2]);
+
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            for token in line.split_whitespace() {
+                if token.starts_with(&prefix) {
+                    if let Some(ip_str) = token.split('/').next() {
+                        if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
+                            return Some(addr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn send_tcp_packet_platform(
+    target_ip: &str,
+    port: u16,
+    message: &str,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+
+    let clean_ip = target_ip.trim();
+    let parsed_ip: Ipv4Addr = clean_ip
+        .parse()
+        .map_err(|e| format!("Ungültige Ziel-IPv4 '{}': {}", clean_ip, e))?;
+    let sock_addr = SocketAddr::new(IpAddr::V4(parsed_ip), port);
+
+    if let Some(local_ip) = find_local_ipv4_in_same_subnet(clean_ip) {
+        println!(
+            "[LINUX TCP] Verbinde zu {} (lokale Subnetz-IP: {})",
+            sock_addr, local_ip
+        );
+    } else {
+        println!("[LINUX TCP] Verbinde zu {}", sock_addr);
+    }
+
+    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        .map_err(|e| format!("Linux TCP-Connect zu {} fehlgeschlagen: {}", sock_addr, e))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream
+        .write_all(message.as_bytes())
+        .map_err(|e| format!("Senden fehlgeschlagen: {}", e))?;
+    let _ = stream.flush();
+
+    let mut buf = [0u8; 4096];
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("Keine Antwort vom Peer: {}", e))?;
+
+    let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+    Ok(format!("Antwort vom Peer: {}", reply))
+}

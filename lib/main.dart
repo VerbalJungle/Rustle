@@ -45,6 +45,32 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     }
   }
 
+  void _startPolling({required bool isGo}) {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      try {
+        if (isGo) {
+          final event = await blePollAndHandleGo();
+          if (event != null && mounted) {
+            setState(() {
+              _goEventBanner = event;
+              _status = 'GO: Hotspot & TCP-Server (:4242) laufen!';
+            });
+          }
+        }
+        final tcpMsg = await pollReceivedPackets();
+        if (tcpMsg != null && mounted) {
+          setState(() {
+            _goEventBanner = 'TCP-PAKET EMPFANGEN:\n$tcpMsg';
+            _status = 'Letztes Paket erfolgreich verarbeitet!';
+          });
+        }
+      } catch (e) {
+        if (mounted) setState(() => _status = 'Poll-Fehler: $e');
+      }
+    });
+  }
+
   Future<void> _advertise(bool isGo) async {
     setState(() {
       _busy = true;
@@ -57,29 +83,8 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       );
       setState(() => _status = res);
 
-      _pollTimer?.cancel();
-      // Im Timer in _advertise(true) zusätzlich auf eingehende TCP-Pakete prüfen:
       if (isGo) {
-        _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
-          try {
-            final event = await blePollAndHandleGo();
-            if (event != null && mounted) {
-              setState(() {
-                _goEventBanner = event;
-                _status = 'GO: Hotspot & TCP-Server (:4242) laufen!';
-              });
-            }
-            final tcpMsg = await pollReceivedPackets();
-            if (tcpMsg != null && mounted) {
-              setState(() {
-                _goEventBanner = 'TCP-PAKET EMPFANGEN:\n$tcpMsg';
-                _status = 'Letztes Paket erfolgreich verarbeitet!';
-              });
-            }
-          } catch (e) {
-            if (mounted) setState(() => _status = 'GO Fehler: $e');
-          }
-        });
+        _startPolling(isGo: true);
       }
     } catch (e) {
       setState(() => _status = 'Broadcast-Fehler: $e');
@@ -117,6 +122,8 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         clientName: 'PeerClient',
       );
       setState(() => _status = 'ERFOLG!\n$res');
+      // Auch als Client auf eingehende TCP-Pakete vom GO lauschen!
+      _startPolling(isGo: false);
     } catch (e) {
       setState(() => _status = 'Handshake-Fehler:\n$e');
     } finally {

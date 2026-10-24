@@ -39,10 +39,8 @@ Future<String> bleHandshakeAndJoinWifi({
   clientName: clientName,
 );
 
-/// Sendet ein echtes TCP-Paket über die Wi-Fi-Verbindung an den GO und liest dessen Antwort
 Future<String> sendTestPacket({required String payload}) =>
     RustLib.instance.api.crateApiWifiSendTestPacket(payload: payload);
 
-/// Fragt auf dem GO ab, ob neue TCP-Pakete eingegangen sind
 Future<String?> pollReceivedPackets() =>
     RustLib.instance.api.crateApiWifiPollReceivedPackets();
