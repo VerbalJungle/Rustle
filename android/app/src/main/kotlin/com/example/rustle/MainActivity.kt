@@ -11,18 +11,22 @@ class MainActivity: FlutterActivity() {
         super.onCreate(savedInstanceState)
         NativeWifiBridge.init(this)
 
-        // Fragt Berechtigungen direkt nativ beim App-Start ab
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_ADVERTISE,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ),
-                1001
-            )
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Zwingend für Hotspot ab Android 13+:
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+
+        ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 1001)
     }
 }

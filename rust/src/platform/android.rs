@@ -138,4 +138,41 @@ impl BleDevice for AndroidBleManager {
                 Ok(Some(res))
             }
     }
+
+    fn set_hotspot_credentials(&mut self, credentials: &str) -> Result<(), String> {
+            let vm = JVM.get().ok_or("JavaVM fehlt")?;
+            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+            let j_creds = env.new_string(credentials).map_err(|e| e.to_string())?;
+
+            call_kotlin_bridge(
+                "setBleHotspotCredentials",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&j_creds)],
+            )?;
+            Ok(())
+    }
+}
+
+pub fn send_tcp_packet_platform(target_ip: &str, port: u16, message: &str) -> Result<String, String> {
+    let vm = JVM.get().ok_or("JavaVM fehlt")?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+
+    let j_ip = env.new_string(target_ip).map_err(|e| e.to_string())?;
+    let j_msg = env.new_string(message).map_err(|e| e.to_string())?;
+
+    let res = call_kotlin_bridge(
+        "sendTcpPacketOverWifi",
+        "(Ljava/lang/String;ILjava/lang/String;)Ljava/lang/String;",
+        &[
+            JValue::Object(&j_ip),
+            JValue::Int(port as i32),
+            JValue::Object(&j_msg),
+        ],
+    )?;
+
+    if res.starts_with("ERR:") {
+        Err(res)
+    } else {
+        Ok(res)
+    }
 }

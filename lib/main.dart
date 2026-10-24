@@ -19,7 +19,7 @@ class BleDiagnosticPage extends StatefulWidget {
 
 class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   String _status = 'Noch nicht initialisiert';
-  String? _incomingRequest;
+  String? _goEventBanner;
   List<DiscoveredPeer> _peers = [];
   bool _busy = false;
   Timer? _pollTimer;
@@ -48,7 +48,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   Future<void> _advertise(bool isGo) async {
     setState(() {
       _busy = true;
-      _incomingRequest = null;
+      _goEventBanner = null;
     });
     try {
       final res = await bleStartBroadcast(
@@ -57,16 +57,27 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       );
       setState(() => _status = res);
 
-      // Wenn wir GO sind, prüfen wir jede Sekunde auf eingehende Paket-2-Anfragen
       _pollTimer?.cancel();
+      // Im Timer in _advertise(true) zusätzlich auf eingehende TCP-Pakete prüfen:
       if (isGo) {
         _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
-          final req = await blePollIncomingRequest();
-          if (req != null && mounted) {
-            setState(() {
-              _incomingRequest = req;
-              _status = 'PAKET 2 EMPFANGEN: "$req"';
-            });
+          try {
+            final event = await blePollAndHandleGo();
+            if (event != null && mounted) {
+              setState(() {
+                _goEventBanner = event;
+                _status = 'GO: Hotspot & TCP-Server (:4242) laufen!';
+              });
+            }
+            final tcpMsg = await pollReceivedPackets();
+            if (tcpMsg != null && mounted) {
+              setState(() {
+                _goEventBanner = 'TCP-PAKET EMPFANGEN:\n$tcpMsg';
+                _status = 'Letztes Paket erfolgreich verarbeitet!';
+              });
+            }
+          } catch (e) {
+            if (mounted) setState(() => _status = 'GO Fehler: $e');
           }
         });
       }
@@ -86,7 +97,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       final found = await bleScan(durationSecs: BigInt.from(4));
       setState(() {
         _peers = found;
-        _status = 'Scan beendet: ${found.length} Geräte gesehen. Tippe auf einen GO!';
+        _status = 'Scan beendet: ${found.length} Geräte. Tippe auf einen GO zum Verbinden!';
       });
     } catch (e) {
       setState(() => _status = 'Scan-Fehler: $e');
@@ -95,19 +106,19 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     }
   }
 
-  Future<void> _sendRequestToGo(DiscoveredPeer peer) async {
+  Future<void> _startFullHandshake(DiscoveredPeer peer) async {
     setState(() {
       _busy = true;
-      _status = 'Sende Paket 2 (Verbindungs-Wunsch) an ${peer.name} (${peer.address})...';
+      _status = '1/3 Sende Paket 2 an ${peer.name}...\n2/3 Warte auf Hotspot & Paket 3...\n3/3 Verbinde Wi-Fi...';
     });
     try {
-      final res = await bleSendConnectRequest(
+      final res = await bleHandshakeAndJoinWifi(
         targetAddress: peer.address,
         clientName: 'PeerClient',
       );
-      setState(() => _status = res);
+      setState(() => _status = 'ERFOLG!\n$res');
     } catch (e) {
-      setState(() => _status = 'Fehler bei Paket 2: $e');
+      setState(() => _status = 'Handshake-Fehler:\n$e');
     } finally {
       setState(() => _busy = false);
     }
@@ -116,7 +127,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Schritt 2: BLE Handshake (SYN)')),
+      appBar: AppBar(title: const Text('Rustle: BLE -> Wi-Fi Handshake')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -127,26 +138,26 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                 Expanded(
                   child: ElevatedButton(
                     onPressed: _busy ? null : () => _advertise(true),
-                    child: const Text('1. Sende als GO'),
+                    child: const Text('1. Als GO warten'),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton(
                     onPressed: _busy ? null : _scan,
-                    child: const Text('2. BLE Scanner'),
+                    child: const Text('2. Als Client scannen'),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 12),
-            if (_incomingRequest != null)
+            if (_goEventBanner != null)
               Container(
                 padding: const EdgeInsets.all(12),
                 margin: const EdgeInsets.only(bottom: 12),
                 color: Colors.green.shade100,
                 child: Text(
-                  'Verbindungs-Wunsch erhalten: $_incomingRequest',
+                  _goEventBanner!,
                   style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
                 ),
               ),
@@ -155,9 +166,33 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
               color: Colors.black12,
               child: Text(_status, style: const TextStyle(fontFamily: 'monospace')),
             ),
+            const SizedBox(height: 8),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.bolt),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade100),
+              onPressed: _busy
+                  ? null
+                  : () async {
+                setState(() {
+                  _busy = true;
+                  _status = 'Sende TCP-Paket über Wi-Fi Direct...';
+                });
+                try {
+                  final res = await sendTestPacket(
+                    payload: 'Hallo von Rustle (${DateTime.now().second}s)!',
+                  );
+                  setState(() => _status = res);
+                } catch (e) {
+                  setState(() => _status = 'TCP-Fehler: $e');
+                } finally {
+                  setState(() => _busy = false);
+                }
+              },
+              label: const Text('3. Test-Paket über Wi-Fi senden (TCP :4242)'),
+            ),
             const SizedBox(height: 16),
             const Text(
-              'Gefundene Geräte (Antippen, um Paket 2 zu senden):',
+              'Gefundene Geräte (Antippen für automatischen BLE -> Wi-Fi Connect):',
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             const Divider(),
@@ -174,8 +209,8 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                       ),
                       title: Text('${p.name} (${p.isGo ? "GO" : "Andere"})'),
                       subtitle: Text('MAC: ${p.address} | RSSI: ${p.rssi} dBm'),
-                      trailing: const Icon(Icons.send),
-                      onTap: _busy ? null : () => _sendRequestToGo(p),
+                      trailing: const Icon(Icons.wifi_tethering),
+                      onTap: _busy ? null : () => _startFullHandshake(p),
                     ),
                   );
                 },

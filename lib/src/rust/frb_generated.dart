@@ -72,7 +72,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -196631347;
+  int get rustContentHash => 1149680770;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -84,15 +84,15 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
-  Future<String?> crateApiWifiBlePollIncomingRequest();
+  Future<String> crateApiWifiBleHandshakeAndJoinWifi({
+    required String targetAddress,
+    required String clientName,
+  });
+
+  Future<String?> crateApiWifiBlePollAndHandleGo();
 
   Future<List<DiscoveredPeer>> crateApiWifiBleScan({
     required BigInt durationSecs,
-  });
-
-  Future<String> crateApiWifiBleSendConnectRequest({
-    required String targetAddress,
-    required String clientName,
   });
 
   Future<String> crateApiWifiBleStartBroadcast({
@@ -107,6 +107,10 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiSimpleInitApp();
 
   Future<String> crateApiWifiInitCore();
+
+  Future<String?> crateApiWifiPollReceivedPackets();
+
+  Future<String> crateApiWifiSendTestPacket({required String payload});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -118,11 +122,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  Future<String?> crateApiWifiBlePollIncomingRequest() {
+  Future<String> crateApiWifiBleHandshakeAndJoinWifi({
+    required String targetAddress,
+    required String clientName,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(targetAddress, serializer);
+          sse_encode_String(clientName, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -131,18 +140,48 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiBleHandshakeAndJoinWifiConstMeta,
+        argValues: [targetAddress, clientName],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiBleHandshakeAndJoinWifiConstMeta =>
+      const TaskConstMeta(
+        debugName: "ble_handshake_and_join_wifi",
+        argNames: ["targetAddress", "clientName"],
+      );
+
+  @override
+  Future<String?> crateApiWifiBlePollAndHandleGo() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
           decodeSuccessData: sse_decode_opt_String,
           decodeErrorData: sse_decode_String,
         ),
-        constMeta: kCrateApiWifiBlePollIncomingRequestConstMeta,
+        constMeta: kCrateApiWifiBlePollAndHandleGoConstMeta,
         argValues: [],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiWifiBlePollIncomingRequestConstMeta =>
-      const TaskConstMeta(debugName: "ble_poll_incoming_request", argNames: []);
+  TaskConstMeta get kCrateApiWifiBlePollAndHandleGoConstMeta =>
+      const TaskConstMeta(debugName: "ble_poll_and_handle_go", argNames: []);
 
   @override
   Future<List<DiscoveredPeer>> crateApiWifiBleScan({
@@ -156,7 +195,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 3,
             port: port_,
           );
         },
@@ -173,41 +212,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiWifiBleScanConstMeta =>
       const TaskConstMeta(debugName: "ble_scan", argNames: ["durationSecs"]);
-
-  @override
-  Future<String> crateApiWifiBleSendConnectRequest({
-    required String targetAddress,
-    required String clientName,
-  }) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(targetAddress, serializer);
-          sse_encode_String(clientName, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 3,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiWifiBleSendConnectRequestConstMeta,
-        argValues: [targetAddress, clientName],
-        apiImpl: this,
-      ),
-    );
-  }
-
-  TaskConstMeta get kCrateApiWifiBleSendConnectRequestConstMeta =>
-      const TaskConstMeta(
-        debugName: "ble_send_connect_request",
-        argNames: ["targetAddress", "clientName"],
-      );
 
   @override
   Future<String> crateApiWifiBleStartBroadcast({
@@ -347,6 +351,61 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiWifiInitCoreConstMeta =>
       const TaskConstMeta(debugName: "init_core", argNames: []);
+
+  @override
+  Future<String?> crateApiWifiPollReceivedPackets() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 9,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiPollReceivedPacketsConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiPollReceivedPacketsConstMeta =>
+      const TaskConstMeta(debugName: "poll_received_packets", argNames: []);
+
+  @override
+  Future<String> crateApiWifiSendTestPacket({required String payload}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(payload, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 10,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiSendTestPacketConstMeta,
+        argValues: [payload],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiSendTestPacketConstMeta =>
+      const TaskConstMeta(debugName: "send_test_packet", argNames: ["payload"]);
 
   @protected
   String dco_decode_String(dynamic raw) {

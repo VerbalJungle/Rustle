@@ -8,6 +8,8 @@ import '../platform.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `ensure_tcp_server_running`
+
 Future<String> initCore() => RustLib.instance.api.crateApiWifiInitCore();
 
 Future<String> bleStartBroadcast({
@@ -24,13 +26,23 @@ Future<String> bleStopBroadcast() =>
 Future<List<DiscoveredPeer>> bleScan({required BigInt durationSecs}) =>
     RustLib.instance.api.crateApiWifiBleScan(durationSecs: durationSecs);
 
-Future<String> bleSendConnectRequest({
+/// Auf dem GO: Prüft auf Paket 2 -> Startet Hotspot & TCP-Server -> Stellt Paket 3 (SSID;PSK;IP) bereit
+Future<String?> blePollAndHandleGo() =>
+    RustLib.instance.api.crateApiWifiBlePollAndHandleGo();
+
+/// Auf dem Client: Sendet Paket 2 -> Empfängt Paket 3 (SSID;PSK;IP) -> Verbindet Wi-Fi
+Future<String> bleHandshakeAndJoinWifi({
   required String targetAddress,
   required String clientName,
-}) => RustLib.instance.api.crateApiWifiBleSendConnectRequest(
+}) => RustLib.instance.api.crateApiWifiBleHandshakeAndJoinWifi(
   targetAddress: targetAddress,
   clientName: clientName,
 );
 
-Future<String?> blePollIncomingRequest() =>
-    RustLib.instance.api.crateApiWifiBlePollIncomingRequest();
+/// Sendet ein echtes TCP-Paket über die Wi-Fi-Verbindung an den GO und liest dessen Antwort
+Future<String> sendTestPacket({required String payload}) =>
+    RustLib.instance.api.crateApiWifiSendTestPacket(payload: payload);
+
+/// Fragt auf dem GO ab, ob neue TCP-Pakete eingegangen sind
+Future<String?> pollReceivedPackets() =>
+    RustLib.instance.api.crateApiWifiPollReceivedPackets();

@@ -1,15 +1,20 @@
-use super::{BleDevice, DiscoveredPeer, WifiDirectDevice, RUSTLE_SERVICE_UUID, RUSTLE_SYN_CHAR_UUID};
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use zbus::{Connection, zvariant::Value};
+use super::{
+    BleDevice, DiscoveredPeer, WifiDirectDevice, RUSTLE_ACK_CHAR_UUID, RUSTLE_SERVICE_UUID,
+    RUSTLE_SYN_CHAR_UUID,
+};
 use bluer::adv::{Advertisement, AdvertisementHandle};
 use bluer::gatt::local::{
-    Application, ApplicationHandle, Characteristic, CharacteristicWrite, CharacteristicWriteMethod,
-    Service,
+    Application, ApplicationHandle, Characteristic, CharacteristicRead, CharacteristicWrite,
+    CharacteristicWriteMethod, Service,
 };
 use bluer::{Address, Uuid};
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zbus::{zvariant::Value, Connection};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 pub struct WifiDirectManager;
 
@@ -21,7 +26,6 @@ impl WifiDirectManager {
 
 impl WifiDirectDevice for WifiDirectManager {
     fn start_discovery(&mut self) -> Result<(), String> {
-        println!("Linux: Wi-Fi P2P Suche gestartet via wpa_supplicant");
         Ok(())
     }
 
@@ -33,7 +37,9 @@ impl WifiDirectDevice for WifiDirectManager {
         async_std_or_tokio_block(async {
             start_hotspot_internal(&ssid, &psk)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            // NEU: Gibt "SSID;PSK;IP" zurück (NetworkManager Shared Standard-IP ist 10.42.0.1)
+            Ok(format!("{};{};10.42.0.1", ssid, psk))
         })
     }
 
@@ -53,7 +59,6 @@ where
     futures_lite::future::block_on(future)
 }
 
-// 1. Hotspot erstellen (Wieder eingefügt)
 async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn std::error::Error>> {
     let connection = Connection::system().await?;
     let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
@@ -83,7 +88,8 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
         "org.freedesktop.NetworkManager",
         "/org/freedesktop/NetworkManager/Settings",
         "org.freedesktop.NetworkManager.Settings",
-    ).await?;
+    )
+    .await?;
 
     let path: zbus::zvariant::OwnedObjectPath = proxy.call("AddConnection", &(settings)).await?;
 
@@ -92,7 +98,8 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
         "org.freedesktop.NetworkManager",
         "/org/freedesktop/NetworkManager",
         "org.freedesktop.NetworkManager",
-    ).await?;
+    )
+    .await?;
 
     let active_path: zbus::zvariant::OwnedObjectPath = nm_proxy
         .call(
@@ -108,8 +115,10 @@ async fn start_hotspot_internal(ssid: &str, psk: &str) -> Result<String, Box<dyn
     Ok(format!("Hotspot aktiv: {:?}", active_path))
 }
 
-// 2. Mit Hotspot verbinden
-async fn connect_to_hotspot_internal(ssid: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn connect_to_hotspot_internal(
+    ssid: &str,
+    password: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let connection = Connection::system().await?;
     let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
@@ -133,7 +142,8 @@ async fn connect_to_hotspot_internal(ssid: &str, password: &str) -> Result<Strin
         "org.freedesktop.NetworkManager",
         "/org/freedesktop/NetworkManager/Settings",
         "org.freedesktop.NetworkManager.Settings",
-    ).await?;
+    )
+    .await?;
 
     let path: zbus::zvariant::OwnedObjectPath = proxy.call("AddConnection", &(settings)).await?;
 
@@ -142,7 +152,8 @@ async fn connect_to_hotspot_internal(ssid: &str, password: &str) -> Result<Strin
         "org.freedesktop.NetworkManager",
         "/org/freedesktop/NetworkManager",
         "org.freedesktop.NetworkManager",
-    ).await?;
+    )
+    .await?;
 
     let active_path: zbus::zvariant::OwnedObjectPath = nm_proxy
         .call(
@@ -155,7 +166,7 @@ async fn connect_to_hotspot_internal(ssid: &str, password: &str) -> Result<Strin
         )
         .await?;
 
-    Ok(format!("Verbindung initiiert: {:?}", active_path))
+    Ok(format!("Mit '{}' verbunden ({:?})", ssid, active_path))
 }
 
 // -----------------------------------
@@ -167,6 +178,7 @@ pub struct LinuxBleManager {
     adv_handle: Option<AdvertisementHandle>,
     app_handle: Option<ApplicationHandle>,
     incoming_request: Arc<Mutex<Option<String>>>,
+    hotspot_credentials: Arc<Mutex<String>>,
 }
 
 impl LinuxBleManager {
@@ -180,81 +192,103 @@ impl LinuxBleManager {
             adv_handle: None,
             app_handle: None,
             incoming_request: Arc::new(Mutex::new(None)),
+            hotspot_credentials: Arc::new(Mutex::new(String::new())),
         }
     }
 }
 
 impl BleDevice for LinuxBleManager {
     fn start_advertising(&mut self, device_name: &str, is_go: bool) -> Result<String, String> {
-            let role_prefix = if is_go { "R_GO_" } else { "R_CL_" };
-            let short_name: String = device_name.chars().take(4).collect();
-            let local_name = format!("{}{}", role_prefix, short_name);
+        let role_prefix = if is_go { "R_GO_" } else { "R_CL_" };
+        let short_name: String = device_name.chars().take(4).collect();
+        let local_name = format!("{}{}", role_prefix, short_name);
+        let local_name_for_return = local_name.clone();
 
-            // Klon für die finale Rückgabe anlegen, da das Original in den Async-Block moved
-            let local_name_for_return = local_name.clone();
+        *self.incoming_request.lock().unwrap() = None;
+        *self.hotspot_credentials.lock().unwrap() = String::new();
 
-            *self.incoming_request.lock().unwrap() = None;
-            let incoming_clone = self.incoming_request.clone();
+        let incoming_clone = self.incoming_request.clone();
+        let creds_clone = self.hotspot_credentials.clone();
 
-            let (adv_handle, app_handle) = self.rt.block_on(async move {
-                let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
-                let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
-                adapter.set_powered(true).await.map_err(|e| e.to_string())?;
+        let (adv_handle, app_handle) = self.rt.block_on(async move {
+            let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
+            let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
+            adapter.set_powered(true).await.map_err(|e| e.to_string())?;
 
-                let syn_char = Characteristic {
-                    uuid: Uuid::from_u128(RUSTLE_SYN_CHAR_UUID),
-                    write: Some(CharacteristicWrite {
-                        write: true,
-                        write_without_response: true,
-                        method: CharacteristicWriteMethod::Fun(Box::new(move |new_value, _req| {
-                            let incoming = incoming_clone.clone();
-                            Box::pin(async move {
-                                if let Ok(msg) = String::from_utf8(new_value) {
-                                    println!("Linux GATT empfing Paket 2: {}", msg);
-                                    if let Ok(mut lock) = incoming.lock() {
-                                        *lock = Some(msg);
-                                    }
+            // Charakteristik 1: Briefkasten für Paket 2 (Write)
+            let syn_char = Characteristic {
+                uuid: Uuid::from_u128(RUSTLE_SYN_CHAR_UUID),
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    write_without_response: true,
+                    method: CharacteristicWriteMethod::Fun(Box::new(move |new_value, _req| {
+                        let incoming = incoming_clone.clone();
+                        Box::pin(async move {
+                            if let Ok(msg) = String::from_utf8(new_value) {
+                                println!("Linux GATT empfing Paket 2: {}", msg);
+                                if let Ok(mut lock) = incoming.lock() {
+                                    *lock = Some(msg);
                                 }
-                                Ok(())
-                            })
-                        })),
-                        ..Default::default()
+                            }
+                            Ok(())
+                        })
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            // Charakteristik 2: Ausgabefach für Paket 3 "SSID;PASSWORT" (Read)
+            let ack_char = Characteristic {
+                uuid: Uuid::from_u128(RUSTLE_ACK_CHAR_UUID),
+                read: Some(CharacteristicRead {
+                    read: true,
+                    fun: Box::new(move |_req| {
+                        let creds = creds_clone.clone();
+                        Box::pin(async move {
+                            let val = creds.lock().map(|c| c.as_bytes().to_vec()).unwrap_or_default();
+                            Ok(val)
+                        })
                     }),
                     ..Default::default()
-                };
+                }),
+                ..Default::default()
+            };
 
-                let service = Service {
-                    uuid: Uuid::from_u128(RUSTLE_SERVICE_UUID),
-                    primary: true,
-                    characteristics: vec![syn_char],
-                    ..Default::default()
-                };
+            let service = Service {
+                uuid: Uuid::from_u128(RUSTLE_SERVICE_UUID),
+                primary: true,
+                characteristics: vec![syn_char, ack_char],
+                ..Default::default()
+            };
 
-                let app = Application {
-                    services: vec![service],
-                    ..Default::default()
-                };
+            let app = Application {
+                services: vec![service],
+                ..Default::default()
+            };
 
-                let app_h = adapter.serve_gatt_application(app).await.map_err(|e| e.to_string())?;
+            let app_h = adapter.serve_gatt_application(app).await.map_err(|e| e.to_string())?;
 
-                let mut service_uuids = BTreeSet::new();
-                service_uuids.insert(Uuid::from_u128(RUSTLE_SERVICE_UUID));
+            let mut service_uuids = BTreeSet::new();
+            service_uuids.insert(Uuid::from_u128(RUSTLE_SERVICE_UUID));
 
-                let le_advertisement = Advertisement {
-                    advertisement_type: bluer::adv::Type::Peripheral,
-                    service_uuids,
-                    local_name: Some(local_name), // Hier wird das Original reingeschoben
-                    ..Default::default()
-                };
+            let le_advertisement = Advertisement {
+                advertisement_type: bluer::adv::Type::Peripheral,
+                service_uuids,
+                local_name: Some(local_name),
+                ..Default::default()
+            };
 
-                let adv_h = adapter.advertise(le_advertisement).await.map_err(|e| e.to_string())?;
-                Ok::<_, String>((adv_h, app_h))
-            })?;
+            let adv_h = adapter.advertise(le_advertisement).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>((adv_h, app_h))
+        })?;
 
-            self.adv_handle = Some(adv_handle);
-            self.app_handle = Some(app_handle);
-            // Hier nutzen wir nun den Klon:
-            Ok(format!("Linux GO bereit ('{}') - Wartet auf Paket 2...", local_name_for_return))
+        self.adv_handle = Some(adv_handle);
+        self.app_handle = Some(app_handle);
+        Ok(format!(
+            "Linux GO bereit ('{}') - Wartet auf Paket 2...",
+            local_name_for_return
+        ))
     }
 
     fn stop_advertising(&mut self) -> Result<String, String> {
@@ -299,7 +333,11 @@ impl BleDevice for LinuxBleManager {
         })
     }
 
-    fn send_connection_request(&mut self, target_address: &str, client_name: &str) -> Result<String, String> {
+    fn send_connection_request(
+        &mut self,
+        target_address: &str,
+        client_name: &str,
+    ) -> Result<String, String> {
         let addr = Address::from_str(target_address).map_err(|e| format!("Ungültige MAC: {}", e))?;
         let payload = format!("CONNECT;{}", client_name);
 
@@ -309,10 +347,12 @@ impl BleDevice for LinuxBleManager {
             let device = adapter.device(addr).map_err(|e| e.to_string())?;
 
             if !device.is_connected().await.unwrap_or(false) {
-                device.connect().await.map_err(|e| format!("BLE Connect fehlgeschlagen: {}", e))?;
+                device
+                    .connect()
+                    .await
+                    .map_err(|e| format!("BLE Connect fehlgeschlagen: {}", e))?;
             }
 
-            // Kurz warten, bis GATT-Services aufgelöst sind
             for _ in 0..10 {
                 if device.is_services_resolved().await.unwrap_or(false) {
                     break;
@@ -321,25 +361,83 @@ impl BleDevice for LinuxBleManager {
             }
 
             let target_service = Uuid::from_u128(RUSTLE_SERVICE_UUID);
-            let target_char = Uuid::from_u128(RUSTLE_SYN_CHAR_UUID);
+            let syn_uuid = Uuid::from_u128(RUSTLE_SYN_CHAR_UUID);
+            let ack_uuid = Uuid::from_u128(RUSTLE_ACK_CHAR_UUID);
+
+            let mut syn_char_found = None;
+            let mut ack_char_found = None;
 
             for service in device.services().await.map_err(|e| e.to_string())? {
                 if service.uuid().await.ok() == Some(target_service) {
                     for ch in service.characteristics().await.map_err(|e| e.to_string())? {
-                        if ch.uuid().await.ok() == Some(target_char) {
-                            ch.write(payload.as_bytes()).await.map_err(|e| format!("GATT Write Fehler: {}", e))?;
-                            return Ok(format!("Paket 2 ('{}') erfolgreich an {} gesendet!", payload, target_address));
+                        let u = ch.uuid().await.ok();
+                        if u == Some(syn_uuid) {
+                            syn_char_found = Some(ch);
+                        } else if u == Some(ack_uuid) {
+                            ack_char_found = Some(ch);
                         }
                     }
                 }
             }
 
-            Err("Rustle GATT-Service/Charakteristik auf Zielgerät nicht gefunden".into())
+            let syn_char = syn_char_found.ok_or("SYN-Charakteristik auf GO nicht gefunden")?;
+            let ack_char = ack_char_found.ok_or("ACK-Charakteristik auf GO nicht gefunden")?;
+
+            // 1. Paket 2 schreiben
+            syn_char
+                .write(payload.as_bytes())
+                .await
+                .map_err(|e| format!("GATT Write Fehler: {}", e))?;
+
+            // 2. Auf Paket 3 (SSID;PASSWORT) warten (bis zu 15 Sekunden)
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(bytes) = ack_char.read().await {
+                    if let Ok(creds) = String::from_utf8(bytes) {
+                        if creds.contains(';') {
+                            let _ = device.disconnect().await;
+                            return Ok(creds);
+                        }
+                    }
+                }
+            }
+
+            let _ = device.disconnect().await;
+            Err("Timeout: GO hat keine Wi-Fi Zugangsdaten (Paket 3) bereitgestellt".into())
         })
     }
 
     fn poll_incoming_request(&mut self) -> Result<Option<String>, String> {
         let mut lock = self.incoming_request.lock().map_err(|e| e.to_string())?;
-        Ok(lock.take()) // Gibt die Anfrage zurück und leert das Feld wieder
+        Ok(lock.take())
+    }
+
+    fn set_hotspot_credentials(&mut self, credentials: &str) -> Result<(), String> {
+        let mut lock = self.hotspot_credentials.lock().map_err(|e| e.to_string())?;
+        *lock = credentials.to_string();
+        Ok(())
     }
 }
+
+pub fn send_tcp_packet_platform(target_ip: &str, port: u16, message: &str) -> Result<String, String> {
+        let addr = format!("{}:{}", target_ip, port);
+        let sock_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("Ungültige Zieladresse {}: {}", addr, e))?;
+
+        let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+            .map_err(|e| format!("TCP-Connect zu {} fehlgeschlagen: {}", addr, e))?;
+
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        stream
+            .write_all(message.as_bytes())
+            .map_err(|e| format!("Senden fehlgeschlagen: {}", e))?;
+
+        let mut buf = [0u8; 4096];
+        let n = stream
+            .read(&mut buf)
+            .map_err(|e| format!("Keine Antwort vom GO: {}", e))?;
+
+        let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+        Ok(format!("Antwort vom GO: {}", reply))
+    }
