@@ -39,6 +39,9 @@ object NativeWifiBridge {
 
     private var activeNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
+    // Cache für gescannte BluetoothDevice-Objekte (bewahrt den exakten BLE Address-Type Public/Random!)
+    private val discoveredBleDevices = ConcurrentHashMap<String, BluetoothDevice>()
+
     @Volatile
     private var lastIncomingRequest: String = ""
 
@@ -204,17 +207,48 @@ object NativeWifiBridge {
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device
+                discoveredBleDevices[dev.address] = dev
                 val name = result.scanRecord?.deviceName ?: dev.name ?: "<Unbekannt>"
                 val rssi = result.rssi
                 found[dev.address] = "${dev.address}|$name|$rssi"
             }
         }
 
-        scanner.startScan(callback)
+        val scanSettings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        scanner.startScan(null, scanSettings, callback)
         Thread.sleep(durationSecs * 1000L)
         scanner.stopScan(callback)
 
         return found.values.joinToString(System.lineSeparator())
+    }
+
+    /**
+     * Entfernt eine veraltete Bluetooth-Kopplung (Stale Bond), die bei BLE-Verbindungen
+     * sofort zu status=5 (GATT_INSUFFICIENT_AUTHENTICATION / HCI_ERR_AUTH_FAILURE) führt.
+     */
+    private fun removeStaleBondIfNeeded(device: BluetoothDevice): Boolean {
+        return try {
+            val bondState = device.bondState
+            println("Prüfe Bond-Status für ${device.address}: bondState=$bondState")
+            val method = device.javaClass.getMethod("removeBond")
+            val invoked = method.invoke(device) as? Boolean ?: false
+            println("removeBond() für ${device.address} aufgerufen -> Erfolg=$invoked")
+            invoked
+        } catch (e: Exception) {
+            println("removeBond() Hinweis: ${e.message}")
+            false
+        }
+    }
+
+    private fun refreshGattCache(gatt: BluetoothGatt) {
+        try {
+            val refresh = gatt.javaClass.getMethod("refresh")
+            refresh.invoke(gatt)
+        } catch (_: Exception) {
+        }
     }
 
     @JvmStatic
@@ -223,124 +257,199 @@ object NativeWifiBridge {
         val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = btManager.adapter ?: return "ERR: Kein BT Adapter"
 
-        val device = try {
+        // Falls noch ein BLE-Scan im Hintergrund aktiv ist, kurz sicherstellen, dass der Controller frei ist
+        try {
+            adapter.bluetoothLeScanner?.flushPendingScanResults(object : ScanCallback() {})
+        } catch (_: Exception) {
+        }
+
+        val device = discoveredBleDevices[targetAddress] ?: try {
             adapter.getRemoteDevice(targetAddress)
         } catch (e: Exception) {
             return "ERR: Ungültige MAC-Adresse: ${e.message}"
         }
 
+        // Falls das Zielgerät in Android als "Gekoppelt" (BOND_BONDED = 12) oder "Koppelnd" (11)
+        // hinterlegt ist, schlägt eine unverschlüsselte BLE-GATT-Verbindung mit status=5 fehl,
+        // wenn der Linux-PC keinen passenden Link-Key (mehr) hat.
+        if (device.bondState != BluetoothDevice.BOND_NONE) {
+            println("Bestehende Kopplung (bondState=${device.bondState}) zu $targetAddress erkannt -> Bereinige vor BLE-Connect...")
+            if (removeStaleBondIfNeeded(device)) {
+                try { Thread.sleep(1000) } catch (_: Exception) {}
+            }
+        }
+
         val future = CompletableFuture<String>()
         val payload = "CONNECT;$clientName".toByteArray(Charsets.UTF_8)
 
-        val gattCallback = object : BluetoothGattCallback() {
-            private var attempts = 0
+        val maxConnectAttempts = 4
+        var connectAttempt = 0
 
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                println("BLE onConnectionStateChange: status=$status, newState=$newState")
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt.discoverServices()
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (!future.isDone) {
-                        future.complete("ERR: BLE Verbindung getrennt (Status $status)")
+        fun attemptGattConnect() {
+            if (future.isDone) return
+            connectAttempt++
+            println("BLE Verbindungsaufbau zu $targetAddress (Versuch $connectAttempt/$maxConnectAttempts, bondState=${device.bondState})...")
+
+            val gattCallback = object : BluetoothGattCallback() {
+                private var ackReadAttempts = 0
+
+                @Volatile
+                private var isCurrentlyConnected = false
+
+                override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                    println("BLE onConnectionStateChange: status=$status, newState=$newState")
+                    if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                        isCurrentlyConnected = true
+                        Thread {
+                            try { Thread.sleep(150) } catch (_: Exception) {}
+                            if (isCurrentlyConnected && !future.isDone) {
+                                val ok = gatt.discoverServices()
+                                println("discoverServices gestartet: $ok")
+                            } else {
+                                println("discoverServices übersprungen (Verbindung wurde bereits durch Controller getrennt)")
+                            }
+                        }.start()
+                    } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                        isCurrentlyConnected = false
+                        refreshGattCache(gatt)
+                        gatt.close()
+
+                        if (status != BluetoothGatt.GATT_SUCCESS && connectAttempt < maxConnectAttempts && !future.isDone) {
+                            // Bei status=5 (GATT_INSUFFICIENT_AUTHENTICATION / HCI_ERR_AUTH_FAILURE) oder 137:
+                            // Veralteten Bond auf Android-Seite aktiv löschen!
+                            if (status == 5 || status == 8 || status == 137 || device.bondState != BluetoothDevice.BOND_NONE) {
+                                println("BLE Auth-Fehler (status=$status) -> Entferne veraltete Kopplung (removeBond)...")
+                                removeStaleBondIfNeeded(device)
+                            }
+                            // Genug Pause lassen (1500ms), damit der Bluetooth-Controller den vorherigen
+                            // Verbindungsversuch sauber abbaut und nicht mit status=147 / 133 antwortet!
+                            val waitMs = 1500L
+                            println("BLE Disconnect mit status=$status -> Erneuter Versuch in ${waitMs}ms...")
+                            Thread {
+                                try { Thread.sleep(waitMs) } catch (_: Exception) {}
+                                attemptGattConnect()
+                            }.start()
+                        } else if (!future.isDone) {
+                            val hint = if (status == 5) {
+                                " (Status 5 = Alte Bluetooth-Kopplung! Bitte den PC einmal in den Android Bluetooth-Einstellungen 'Vergessen'/Entkoppeln)"
+                            } else {
+                                ""
+                            }
+                            future.complete("ERR: BLE Verbindung getrennt (Status $status)$hint")
+                        }
                     }
-                    gatt.close()
-                }
-            }
-
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                println("BLE onServicesDiscovered: status=$status, services=${gatt.services.map { it.uuid }}")
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    future.complete("ERR: Service Discovery fehlgeschlagen ($status)")
-                    gatt.disconnect()
-                    return
-                }
-                val service = gatt.getService(SERVICE_UUID)
-                val synChar = service?.getCharacteristic(SYN_CHAR_UUID)
-                if (synChar == null) {
-                    println("BLE Fehler: SYN-Charakteristik nicht gefunden! Vorhandene Services: ${gatt.services.map { it.uuid }}")
-                    future.complete("ERR: SYN-Charakteristik auf GO nicht gefunden")
-                    gatt.disconnect()
-                    return
                 }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeCharacteristic(synChar, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                } else {
-                    @Suppress("DEPRECATION")
-                    synChar.value = payload
-                    @Suppress("DEPRECATION")
-                    gatt.writeCharacteristic(synChar)
-                }
-            }
-
-            override fun onCharacteristicWrite(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                status: Int
-            ) {
-                println("BLE onCharacteristicWrite: status=$status")
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    pollAckCharacteristic(gatt)
-                } else {
-                    future.complete("ERR: Schreiben von Paket 2 fehlgeschlagen ($status)")
-                    gatt.disconnect()
-                }
-            }
-
-            private fun pollAckCharacteristic(gatt: BluetoothGatt) {
-                val ackChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(ACK_CHAR_UUID)
-                if (ackChar == null) {
-                    future.complete("ERR: ACK-Charakteristik auf GO fehlt")
-                    gatt.disconnect()
-                    return
-                }
-                Thread.sleep(500)
-                gatt.readCharacteristic(ackChar)
-            }
-
-            override fun onCharacteristicRead(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                value: ByteArray,
-                status: Int
-            ) {
-                handleReadResult(gatt, value, status)
-            }
-
-            @Deprecated("Deprecated in Java")
-            override fun onCharacteristicRead(
-                gatt: BluetoothGatt,
-                characteristic: BluetoothGattCharacteristic,
-                status: Int
-            ) {
-                @Suppress("DEPRECATION")
-                handleReadResult(gatt, characteristic.value ?: ByteArray(0), status)
-            }
-
-            private fun handleReadResult(gatt: BluetoothGatt, value: ByteArray, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val str = String(value, Charsets.UTF_8)
-                    println("BLE Read ACK (Versuch $attempts): '$str'")
-                    if (str.contains(";")) {
-                        future.complete(str)
+                override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                    println("BLE onServicesDiscovered: status=$status, services=${gatt.services.map { it.uuid }}")
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        future.complete("ERR: Service Discovery fehlgeschlagen ($status)")
                         gatt.disconnect()
                         return
                     }
+                    val service = gatt.getService(SERVICE_UUID)
+                    val synChar = service?.getCharacteristic(SYN_CHAR_UUID)
+                    if (synChar == null) {
+                        println("BLE Fehler: SYN-Charakteristik nicht gefunden! Vorhandene Services: ${gatt.services.map { it.uuid }}")
+                        future.complete("ERR: SYN-Charakteristik auf GO nicht gefunden")
+                        gatt.disconnect()
+                        return
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(synChar, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        synChar.value = payload
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(synChar)
+                    }
                 }
-                attempts++
-                if (attempts < 30) {
-                    pollAckCharacteristic(gatt)
+
+                override fun onCharacteristicWrite(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    status: Int
+                ) {
+                    println("BLE onCharacteristicWrite: status=$status")
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        pollAckCharacteristic(gatt)
+                    } else {
+                        future.complete("ERR: Schreiben von Paket 2 fehlgeschlagen ($status)")
+                        gatt.disconnect()
+                    }
+                }
+
+                private fun pollAckCharacteristic(gatt: BluetoothGatt) {
+                    val ackChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(ACK_CHAR_UUID)
+                    if (ackChar == null) {
+                        future.complete("ERR: ACK-Charakteristik auf GO fehlt")
+                        gatt.disconnect()
+                        return
+                    }
+                    Thread.sleep(500)
+                    gatt.readCharacteristic(ackChar)
+                }
+
+                override fun onCharacteristicRead(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    value: ByteArray,
+                    status: Int
+                ) {
+                    handleReadResult(gatt, value, status)
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onCharacteristicRead(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    status: Int
+                ) {
+                    @Suppress("DEPRECATION")
+                    handleReadResult(gatt, characteristic.value ?: ByteArray(0), status)
+                }
+
+                private fun handleReadResult(gatt: BluetoothGatt, value: ByteArray, status: Int) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        val str = String(value, Charsets.UTF_8)
+                        println("BLE Read ACK (Versuch $ackReadAttempts): '$str'")
+                        if (str.contains(";")) {
+                            future.complete(str)
+                            gatt.disconnect()
+                            return
+                        }
+                    }
+                    ackReadAttempts++
+                    if (ackReadAttempts < 30) {
+                        pollAckCharacteristic(gatt)
+                    } else {
+                        future.complete("ERR: Timeout beim Warten auf Paket 3 (Hotspot-Daten)")
+                        gatt.disconnect()
+                    }
+                }
+            }
+
+            // Auf dem Main-Looper starten (verhindert Race-Conditions in manchen Android BLE-Stacks)
+            Handler(Looper.getMainLooper()).post {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    device.connectGatt(
+                        ctx,
+                        false,
+                        gattCallback,
+                        BluetoothDevice.TRANSPORT_LE,
+                        BluetoothDevice.PHY_LE_1M_MASK
+                    )
                 } else {
-                    future.complete("ERR: Timeout beim Warten auf Paket 3 (Hotspot-Daten)")
-                    gatt.disconnect()
+                    device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
                 }
             }
         }
 
-        device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        attemptGattConnect()
 
         return try {
-            future.get(25, TimeUnit.SECONDS)
+            future.get(30, TimeUnit.SECONDS)
         } catch (e: Exception) {
             "ERR: Timeout: ${e.message}"
         }
@@ -385,7 +494,6 @@ object NativeWifiBridge {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
 
-            // Falls der Interface-Name aus WifiP2pGroup bekannt ist (z.B. p2p-wlan0-0), prüfe diesen zuerst!
             if (!preferredInterface.isNullOrEmpty()) {
                 val pIntf = interfaces.firstOrNull { it.name.equals(preferredInterface, ignoreCase = true) && it.isUp }
                 if (pIntf != null) {
@@ -401,7 +509,6 @@ object NativeWifiBridge {
                 }
             }
 
-            // Sortiere so, dass P2P-Interfaces (p2p*) und Hotspot-Interfaces (ap*, softap*, swlan*) vor wlan0 stehen
             val sorted = interfaces.sortedBy { intf ->
                 val n = intf.name.lowercase()
                 when {
@@ -464,9 +571,6 @@ object NativeWifiBridge {
 
     /**
      * Startet auf Android einen echten Wi-Fi Direct Autonomous Group Owner via WifiP2pManager.createGroup()!
-     * Vorteil: Das normale Heim-WLAN (wlan0) bleibt dabei ungestört verbunden, während auf p2p-wlan0-x
-     * ein WPA2-GO (Standard-IP 192.168.49.1) aufgespannt wird.
-     * Falls P2P vom Gerät abgelehnt wird, greift automatisch LocalOnlyHotspot als Fallback.
      */
     @JvmStatic
     fun startLocalHotspot(): String {
@@ -478,20 +582,17 @@ object NativeWifiBridge {
 
         val existingClientIps = getActiveWifiClientIps()
 
-        // 1. Versuche echten Wi-Fi Direct Group Owner über WifiP2pManager.createGroup() zu starten
         val p2pPair = ensureP2pInitialized(context)
         if (p2pPair != null) {
             val (mgr, ch) = p2pPair
             val p2pFuture = CompletableFuture<String>()
 
-            // Eventuell bestehende alte P2P-Gruppe zuerst aufräumen, dann neue erstellen
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
                 }
 
                 override fun onFailure(reason: Int) {
-                    // Auch wenn keine Gruppe aktiv war (oder Fehler), jetzt neue erstellen
                     createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
                 }
             })
@@ -508,7 +609,6 @@ object NativeWifiBridge {
             println("WifiP2pManager.createGroup Hinweis ($p2pRes) -> Falle zurück auf LocalOnlyHotspot...")
         }
 
-        // 2. Fallback: LocalOnlyHotspot
         val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val future = CompletableFuture<String>()
 
@@ -570,7 +670,6 @@ object NativeWifiBridge {
     ) {
         val createdListener = object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                // Gruppe wurde erstellt -> Frage nun SSID, Passphrase und Interface-Name ab
                 Thread {
                     for (attempt in 1..20) {
                         if (future.isDone) break
@@ -600,7 +699,6 @@ object NativeWifiBridge {
             }
         }
 
-        // Auf Android 10+ (API 29+) im 2.4-GHz-Band starten für maximale Kompatibilität & Geschwindigkeit
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 val config = WifiP2pConfig.Builder()
@@ -619,11 +717,6 @@ object NativeWifiBridge {
 
     /**
      * Verbindet Android als Client mit dem GO:
-     * 1. Zuerst über echten Wi-Fi Direct (WifiP2pConfig.Builder mit SSID + Passphrase):
-     *    - Kein System-Dialog / Popup nötig!
-     *    - Verbindet über das dedizierte P2P-Interface (p2p-wlan0-x), sodass das normale Heim-WLAN (wlan0)
-     *      weiterhin mit dem Internet verbunden bleibt!
-     * 2. Falls das fehlschlägt (oder SSID nicht mit "DIRECT-" beginnt), Fallback auf WifiNetworkSpecifier.
      */
     @JvmStatic
     fun connectToSpecifier(ssid: String, psk: String): String {
@@ -633,13 +726,11 @@ object NativeWifiBridge {
 
         println("connectToSpecifier aufgerufen: SSID='$ssid', PSK='$psk'")
 
-        // Falls wir bereits im Ziel-Subnetz (10.42.0.x oder 192.168.49.x) verbunden sind, sofort fertig!
         if (findLocalIpInSameSubnet("10.42.0.1") != null || findLocalIpInSameSubnet("192.168.49.1") != null) {
             println("Bereits über lokales P2P/Subnetz-Interface mit '$ssid' verbunden!")
             return "Erfolgreich per Wi-Fi Direct mit '$ssid' verbunden (Heim-WLAN bleibt aktiv)!"
         }
 
-        // 1. Warte kurz (bis zu 6s), bis der GO-AP im Wi-Fi Scan sichtbar ist
         var matchedScan: WifiScanResult? = null
         try {
             for (attempt in 1..6) {
@@ -659,8 +750,6 @@ object NativeWifiBridge {
             }
         } catch (_: Exception) {}
 
-        // 2. PRIMÄRER WEG (API 29+): Echte Wi-Fi Direct Verbindung via WifiP2pManager.connect(WifiP2pConfig)
-        //    Damit bleibt wlan0 im Heim-WLAN, und es erscheint KEIN nerviger System-Verbindungsdialog!
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ssid.startsWith("DIRECT-")) {
             val p2pPair = ensureP2pInitialized(context)
             if (p2pPair != null) {
@@ -684,8 +773,6 @@ object NativeWifiBridge {
                 }
 
                 if (p2pRes == "OK") {
-                    // WICHTIG: Bei P2P-Client ist activeWifiNetwork = null, damit sendTcpPacketOverWifi
-                    // den Socket direkt an die P2P-Interface-IP (10.42.0.x) bindet und wlan0 im Heim-WLAN lässt!
                     activeWifiNetwork = null
                     try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
                     return "Erfolgreich per Wi-Fi Direct mit '$ssid' verbunden (Heim-WLAN bleibt aktiv)!"
@@ -695,7 +782,6 @@ object NativeWifiBridge {
             }
         }
 
-        // 3. FALLBACK: Reguläres WifiNetworkSpecifier (falls P2P-Interface nicht genutzt werden konnte)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             activeNetworkCallback?.let {
                 try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {}
@@ -834,10 +920,6 @@ object NativeWifiBridge {
             val cleanIp = targetIp.trim()
             val targetInet = Inet4Address.getByName(cleanIp)
 
-            // 1. Prüfe zuerst, ob wir ein lokales Interface (z.B. p2p-wlan0-0) im selben /24-Subnetz wie
-            //    die Ziel-IP (z.B. 10.42.0.1 oder 192.168.49.x) haben. Wenn ja, binden wir den Socket direkt
-            //    an diese lokale P2P-IPv4-Adresse! Dadurch läuft der Traffic garantiert über das P2P-Interface,
-            //    während das normale Heim-WLAN (wlan0) unangetastet bleibt!
             val localSubnetAddr = findLocalIpInSameSubnet(cleanIp)
             val clientNet = activeWifiNetwork
 

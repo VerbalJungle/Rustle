@@ -374,6 +374,21 @@ impl BleDevice for LinuxBleManager {
             let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
             let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
             adapter.set_powered(true).await.map_err(|e| e.to_string())?;
+            let _ = adapter.set_pairable(false).await;
+
+            // Entferne nicht-verbundene gecachte Geräte ohne aktiven Dienst aus BlueZ,
+            // damit BlueZ bei eingehenden BLE-Verbindungen keinen veralteten Link-Key (status=5) verlangt.
+            if let Ok(addrs) = adapter.device_addresses().await {
+                for addr in addrs {
+                    if let Ok(dev) = adapter.device(addr) {
+                        let connected = dev.is_connected().await.unwrap_or(false);
+                        let trusted = dev.is_trusted().await.unwrap_or(false);
+                        if !connected && !trusted {
+                            let _ = adapter.remove_device(addr).await;
+                        }
+                    }
+                }
+            }
 
             // Charakteristik 1: Briefkasten für Paket 2 (Write)
             let syn_char = Characteristic {
@@ -442,6 +457,7 @@ impl BleDevice for LinuxBleManager {
                 advertisement_type: bluer::adv::Type::Peripheral,
                 service_uuids,
                 local_name: Some(local_name),
+                discoverable: Some(true),
                 ..Default::default()
             };
 
