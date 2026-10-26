@@ -8,12 +8,14 @@ use bluer::gatt::local::{
     CharacteristicWriteMethod, Service,
 };
 use bluer::{Address, AddressType, Uuid};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use zbus::{zvariant::Value, Connection};
+
+pub const RUSTLE_COMPANY_ID: u16 = 0x5255;
 
 // Speichert das vor dem Rustle-Start aktive normale WLAN-Profil (Name, Interface),
 // damit es beim Beenden der App oder beim Reset automatisch wiederhergestellt wird.
@@ -22,6 +24,9 @@ static PREVIOUS_WIFI_STATE: Mutex<Option<(String, String)>> = Mutex::new(None);
 static ACTIVE_CLIENT_SSID: Mutex<Option<String>> = Mutex::new(None);
 // Merkt sich, ob wir einen Hotspot (Rust_Hotspot) gestartet haben
 static HOTSPOT_ACTIVE: Mutex<bool> = Mutex::new(false);
+// Cache für verbindungslose Wi-Fi Direct Zugangsdaten aus BLE Manufacturer Data (0x5255)
+static DISCOVERED_GO_CREDENTIALS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
 static EXIT_HOOK_INIT: Once = Once::new();
 
 extern "C" {
@@ -36,6 +41,84 @@ fn register_exit_cleanup_once() {
     EXIT_HOOK_INIT.call_once(|| unsafe {
         let _ = atexit(on_linux_process_exit);
     });
+}
+
+fn cache_go_credentials(addr: &str, creds: String) {
+    if let Ok(mut lock) = DISCOVERED_GO_CREDENTIALS.lock() {
+        if lock.is_none() {
+            *lock = Some(HashMap::new());
+        }
+        if let Some(ref mut map) = *lock {
+            map.insert(addr.to_string(), creds);
+        }
+    }
+}
+
+fn get_cached_go_credentials(addr: &str) -> Option<String> {
+    if let Ok(lock) = DISCOVERED_GO_CREDENTIALS.lock() {
+        if let Some(ref map) = *lock {
+            return map.get(addr).cloned();
+        }
+    }
+    None
+}
+
+/// Packt SSID, PSK und IPv4 in ein kompaktes Byte-Array (<= 24 Bytes)
+/// für BLE Connectionless Advertising im Manufacturer Data Feld (0x5255).
+pub fn pack_wifi_credentials(ssid: &str, psk: &str, ip: &str) -> Option<Vec<u8>> {
+    let clean_ip = ip.trim();
+    let parsed_ip: Ipv4Addr = clean_ip.parse().ok()?;
+    let ip_bytes = parsed_ip.octets();
+
+    let clean_ssid = ssid.trim_matches('"');
+    let suffix = if clean_ssid.starts_with("DIRECT-") {
+        &clean_ssid[7..]
+    } else {
+        clean_ssid
+    };
+
+    let psk_bytes = psk.as_bytes();
+    let suffix_bytes = suffix.as_bytes();
+
+    if psk_bytes.len() > 16 || suffix_bytes.len() > 16 {
+        return None;
+    }
+
+    let total_len = 1 + 4 + 1 + psk_bytes.len() + suffix_bytes.len();
+    if total_len > 24 {
+        return None;
+    }
+
+    let mut result = Vec::with_capacity(total_len);
+    result.push(0x52); // Magic 'R'
+    result.extend_from_slice(&ip_bytes);
+    result.push(psk_bytes.len() as u8);
+    result.extend_from_slice(psk_bytes);
+    result.extend_from_slice(suffix_bytes);
+    Some(result)
+}
+
+/// Entpackt empfangene Manufacturer Data Bytes zurück in den String "SSID;PSK;IP".
+pub fn unpack_wifi_credentials(data: &[u8]) -> Option<String> {
+    if data.len() < 7 || data[0] != 0x52 {
+        return None;
+    }
+
+    let ip = format!("{}.{}.{}.{}", data[1], data[2], data[3], data[4]);
+    let psk_len = data[5] as usize;
+    if data.len() < 6 + psk_len {
+        return None;
+    }
+
+    let psk = std::str::from_utf8(&data[6..6 + psk_len]).ok()?;
+    let suffix = std::str::from_utf8(&data[6 + psk_len..]).ok()?;
+    let ssid = if suffix.starts_with("DIRECT-") {
+        suffix.to_string()
+    } else {
+        format!("DIRECT-{}", suffix)
+    };
+
+    Some(format!("{};{};{}", ssid, psk, ip))
 }
 
 /// Merkt sich die aktuell aktive normale WLAN-Verbindung (falls noch nicht gespeichert),
@@ -156,8 +239,6 @@ impl WifiDirectDevice for WifiDirectManager {
 
     fn start_hotspot(&mut self, ssid: String, psk: String) -> Result<String, String> {
         register_exit_cleanup_once();
-        // Erzwinge "DIRECT-" Präfix gemäß Wi-Fi Direct Spezifikation, damit Android WifiP2pManager
-        // sich über das P2P-Interface (p2p-wlan0-x) verbindet und das Heim-WLAN (wlan0) aktiv bleibt!
         let direct_ssid = if ssid.starts_with("DIRECT-") {
             ssid
         } else {
@@ -479,7 +560,9 @@ async fn connect_to_hotspot_internal(
                         println!("[LINUX WIFI] nmcli up erfolgreich für '{}'", ssid);
                         // Warte kurz, bis IP per DHCP vergeben ist
                         for _ in 0..40 {
-                            if find_local_ipv4_in_same_subnet("192.168.49.1").is_some() {
+                            if find_local_ipv4_in_same_subnet("192.168.49.1").is_some()
+                                || find_local_ipv4_in_same_subnet("10.42.0.1").is_some()
+                            {
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(100));
@@ -630,8 +713,7 @@ impl BleDevice for LinuxBleManager {
             adapter.set_powered(true).await.map_err(|e| e.to_string())?;
             let _ = adapter.set_pairable(false).await;
 
-            // Entferne nicht-verbundene gecachte Geräte ohne aktiven Dienst aus BlueZ,
-            // damit BlueZ bei eingehenden BLE-Verbindungen keinen veralteten Link-Key (status=5) verlangt.
+            // Entferne nicht-verbundene gecachte Geräte ohne aktiven Dienst aus BlueZ
             if let Ok(addrs) = adapter.device_addresses().await {
                 for addr in addrs {
                     if let Ok(dev) = adapter.device(addr) {
@@ -644,7 +726,7 @@ impl BleDevice for LinuxBleManager {
                 }
             }
 
-            // Charakteristik 1: Briefkasten für Paket 2 (Write)
+            // Charakteristik 1: Briefkasten für Paket 2 (Write) - als Fallback
             let syn_char = Characteristic {
                 uuid: Uuid::from_u128(RUSTLE_SYN_CHAR_UUID),
                 write: Some(CharacteristicWrite {
@@ -667,20 +749,23 @@ impl BleDevice for LinuxBleManager {
                 ..Default::default()
             };
 
-            // Charakteristik 2: Ausgabefach für Paket 3 "SSID;PASSWORT;IP" (Read)
+            // Charakteristik 2: Ausgabefach für Paket 3 "SSID;PASSWORT;IP" (Read) - als Fallback
             let ack_char = Characteristic {
                 uuid: Uuid::from_u128(RUSTLE_ACK_CHAR_UUID),
                 read: Some(CharacteristicRead {
                     read: true,
-                    fun: Box::new(move |_req| {
+                    fun: Box::new({
                         let creds = creds_clone.clone();
-                        Box::pin(async move {
-                            let val = creds
-                                .lock()
-                                .map(|c| c.as_bytes().to_vec())
-                                .unwrap_or_default();
-                            Ok(val)
-                        })
+                        move |_req| {
+                            let creds = creds.clone();
+                            Box::pin(async move {
+                                let val = creds
+                                    .lock()
+                                    .map(|c| c.as_bytes().to_vec())
+                                    .unwrap_or_default();
+                                Ok(val)
+                            })
+                        }
                     }),
                     ..Default::default()
                 }),
@@ -704,12 +789,41 @@ impl BleDevice for LinuxBleManager {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // CRITICAL BLE LIMIT CHECK:
+            // Maximal 31 Bytes pro Advertising Paket.
+            // Wenn Manufacturer Data (0x5255, 25 Bytes) gesetzt ist, DARF KEINE 128-Bit Service UUID
+            // (18 Bytes) im selben Paket stehen, da 25 + 18 = 43 > 31 Bytes BlueZ HCI Error 0x12 wirft!
             let mut service_uuids = BTreeSet::new();
-            service_uuids.insert(Uuid::from_u128(RUSTLE_SERVICE_UUID));
+            let mut manufacturer_data = BTreeMap::new();
+            let mut has_man_data = false;
+
+            if is_go {
+                if let Ok(creds) = creds_clone.lock() {
+                    if creds.contains(';') {
+                        let parts: Vec<&str> = creds.split(';').collect();
+                        if parts.len() >= 3 {
+                            if let Some(packed) = pack_wifi_credentials(parts[0], parts[1], parts[2]) {
+                                println!(
+                                    "[LINUX BLE] Packe Zugangsdaten '{}' in 0x5255 Manufacturer Data ({} Bytes)",
+                                    creds, packed.len()
+                                );
+                                manufacturer_data.insert(RUSTLE_COMPANY_ID, packed);
+                                has_man_data = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !has_man_data {
+                // Client-Modus: Service UUID ins Advertising
+                service_uuids.insert(Uuid::from_u128(RUSTLE_SERVICE_UUID));
+            }
 
             let le_advertisement = Advertisement {
                 advertisement_type: bluer::adv::Type::Peripheral,
                 service_uuids,
+                manufacturer_data,
                 local_name: Some(local_name),
                 discoverable: Some(true),
                 ..Default::default()
@@ -719,13 +833,14 @@ impl BleDevice for LinuxBleManager {
                 .advertise(le_advertisement)
                 .await
                 .map_err(|e| e.to_string())?;
+            println!("[LINUX BLE] Advertisement erfolgreich bei BlueZ registriert!");
             Ok::<_, String>((adv_h, app_h))
         })?;
 
         self.adv_handle = Some(adv_handle);
         self.app_handle = Some(app_handle);
         Ok(format!(
-            "Linux GO bereit ('{}') - Hotspot aktiv & wartet auf Client...",
+            "Linux GO bereit ('{}') - Hotspot aktiv & werbung läuft...",
             local_name_for_return
         ))
     }
@@ -750,18 +865,28 @@ impl BleDevice for LinuxBleManager {
 
             let _discover = adapter.discover_devices().await.map_err(|e| e.to_string())?;
 
-            // Smart Early-Exit Scan: Prüft alle 150ms, ob bereits ein Rustle-GO ("R_GO_")
+            // Smart Early-Exit Scan: Prüft alle 150ms, ob bereits ein Rustle-GO ("R_GO_" oder Manufacturer Data 0x5255)
             // gefunden wurde, und beendet den Scan dann sofort statt volle 4s zu warten!
             let max_steps = ((duration_secs * 1000) / 150).max(4);
             for step in 1..=max_steps {
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                if step >= 4 {
+                if step >= 3 {
                     if let Ok(addrs) = adapter.device_addresses().await {
                         let mut found_go = false;
                         for addr in addrs {
                             if let Ok(dev) = adapter.device(addr) {
                                 let name = dev.name().await.ok().flatten().unwrap_or_default();
                                 let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
+                                let man_data = dev.manufacturer_data().await.ok().flatten().unwrap_or_default();
+
+                                if let Some(bytes) = man_data.get(&RUSTLE_COMPANY_ID) {
+                                    if let Some(creds) = unpack_wifi_credentials(bytes) {
+                                        cache_go_credentials(&addr.to_string(), creds);
+                                        found_go = true;
+                                        break;
+                                    }
+                                }
+
                                 if name.starts_with("R_GO_")
                                     || uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID))
                                 {
@@ -790,22 +915,41 @@ impl BleDevice for LinuxBleManager {
                     let name = dev.name().await.ok().flatten().unwrap_or_default();
                     let rssi = dev.rssi().await.ok().flatten().unwrap_or(0);
                     let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
+                    let man_data = dev.manufacturer_data().await.ok().flatten().unwrap_or_default();
+
+                    let mut has_our_man_data = false;
+                    if let Some(bytes) = man_data.get(&RUSTLE_COMPANY_ID) {
+                        if let Some(creds) = unpack_wifi_credentials(bytes) {
+                            println!(
+                                "[LINUX BLE] Scan fand Manufacturer Data für {} -> {}",
+                                addr, creds
+                            );
+                            cache_go_credentials(&addr.to_string(), creds);
+                            has_our_man_data = true;
+                        }
+                    }
 
                     let has_our_uuid = uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID));
                     let is_rustle_name = name.starts_with("R_GO_") || name.starts_with("R_CL_");
 
                     if has_our_uuid
+                        || has_our_man_data
                         || is_rustle_name
                         || (!name.is_empty() && addr_type != Some(AddressType::BrEdr))
                     {
-                        let is_go = name.starts_with("R_GO_");
+                        let is_go = has_our_man_data || name.starts_with("R_GO_");
+                        let display_name = if !name.is_empty() {
+                            name
+                        } else if has_our_man_data {
+                            "R_GO_Android".into()
+                        } else if has_our_uuid {
+                            "R_Peer".into()
+                        } else {
+                            "<Unbekannt>".into()
+                        };
                         peers.push(DiscoveredPeer {
                             address: addr.to_string(),
-                            name: if name.is_empty() {
-                                "<Unbekannt>".into()
-                            } else {
-                                name
-                            },
+                            name: display_name,
                             is_go,
                             rssi,
                         });
@@ -823,6 +967,32 @@ impl BleDevice for LinuxBleManager {
         target_address: &str,
         client_name: &str,
     ) -> Result<String, String> {
+        // 1. FAST PATH: Connectionless BLE Handshake über Manufacturer Data (0ms!)
+        if let Some(cached_creds) = get_cached_go_credentials(target_address) {
+            println!(
+                "[LINUX BLE] Connectionless Handshake: Zugangsdaten für {} sofort aus BLE Manufacturer Data verfügbar: {} (0ms!)",
+                target_address, cached_creds
+            );
+            return Ok(cached_creds);
+        }
+
+        // Warte bis zu 600ms, falls das Scan-Ergebnis mit Manufacturer Data gerade eintrifft
+        for w in 1..=6 {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(cached_creds) = get_cached_go_credentials(target_address) {
+                println!(
+                    "[LINUX BLE] Connectionless Handshake nach {}ms: {}",
+                    w * 100, cached_creds
+                );
+                return Ok(cached_creds);
+            }
+        }
+
+        println!(
+            "[LINUX BLE] Manufacturer Data nicht im Cache -> Starte GATT Fallback zu {}...",
+            target_address
+        );
+
         let addr =
             Address::from_str(target_address).map_err(|e| format!("Ungültige MAC: {}", e))?;
         let payload = format!("CONNECT;{}", client_name);

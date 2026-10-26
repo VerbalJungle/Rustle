@@ -22,7 +22,7 @@
 
     <!-- 2. <application> MIT usesCleartextTraffic="true" -->
     <application
-            android:label="rustle"
+            android:label="Rustle"
             android:name="${applicationName}"
             android:icon="@mipmap/ic_launcher"
             android:usesCleartextTraffic="true">
@@ -47,6 +47,17 @@
         <meta-data
                 android:name="flutterEmbedding"
                 android:value="2"/>
+        <!-- Schnellmenü Widget -->
+        <service
+                android:name=".AppShortcutTileService"
+                android:label="Rustle"
+                android:icon="@mipmap/ic_launcher"
+                android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+                android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
     </application>
 
     <queries>

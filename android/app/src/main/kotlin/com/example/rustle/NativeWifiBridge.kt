@@ -49,6 +49,11 @@ object NativeWifiBridge {
     // Cache für gescannte BluetoothDevice-Objekte (bewahrt den exakten BLE Address-Type Public/Random!)
     private val discoveredBleDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
+    // Cache für verbindungslose Wi-Fi Direct Zugangsdaten aus BLE Manufacturer Data (0x5255)
+    private val discoveredGoCredentials = ConcurrentHashMap<String, String>()
+
+    const val RUSTLE_COMPANY_ID = 0x5255
+
     @Volatile
     private var lastIncomingRequest: String = ""
 
@@ -95,6 +100,63 @@ object NativeWifiBridge {
         }
         val ch = p2pChannel ?: return null
         return Pair(mgr, ch)
+    }
+
+    /**
+     * Packt SSID, PSK und IPv4 in ein kompaktes Byte-Array (<= 24 Bytes)
+     * für BLE Connectionless Advertising im Manufacturer Data Feld (0x5255).
+     * Format:
+     * Byte 0: Magic Byte 0x52 ('R')
+     * Byte 1..4: IPv4 Adresse (4 Bytes)
+     * Byte 5: PSK-Länge (1 Byte)
+     * Byte 6..6+pskLen-1: PSK UTF-8 Bytes
+     * Byte 6+pskLen..Ende: SSID Suffix (ohne "DIRECT-")
+     */
+    fun packWifiCredentials(ssid: String, psk: String, ip: String): ByteArray? {
+        val ipParts = ip.trim().split(".")
+        if (ipParts.size != 4) return null
+        val ipBytes = ByteArray(4)
+        for (i in 0..3) {
+            val octet = ipParts[i].toIntOrNull() ?: return null
+            if (octet !in 0..255) return null
+            ipBytes[i] = octet.toByte()
+        }
+
+        val cleanSsid = ssid.removeSurrounding("\"")
+        val suffix = if (cleanSsid.startsWith("DIRECT-")) cleanSsid.substring(7) else cleanSsid
+        val pskBytes = psk.toByteArray(Charsets.UTF_8)
+        val suffixBytes = suffix.toByteArray(Charsets.UTF_8)
+
+        if (pskBytes.size > 16 || suffixBytes.size > 16) return null
+        val totalLen = 1 + 4 + 1 + pskBytes.size + suffixBytes.size
+        if (totalLen > 24) return null // Passt garantiert in BLE Legacy Advertising (<= 24 Bytes)
+
+        val result = ByteArray(totalLen)
+        result[0] = 0x52.toByte()
+        System.arraycopy(ipBytes, 0, result, 1, 4)
+        result[5] = pskBytes.size.toByte()
+        System.arraycopy(pskBytes, 0, result, 6, pskBytes.size)
+        System.arraycopy(suffixBytes, 0, result, 6 + pskBytes.size, suffixBytes.size)
+        return result
+    }
+
+    /**
+     * Entpackt empfangene Manufacturer Data Bytes zurück in den String "SSID;PSK;IP".
+     */
+    fun unpackWifiCredentials(data: ByteArray?): String? {
+        if (data == null || data.size < 7) return null
+        if (data[0] != 0x52.toByte()) return null
+
+        val ip = "${data[1].toUByte()}.${data[2].toUByte()}.${data[3].toUByte()}.${data[4].toUByte()}"
+        val pskLen = data[5].toInt() and 0xFF
+        if (data.size < 6 + pskLen) return null
+
+        val psk = String(data, 6, pskLen, Charsets.UTF_8)
+        val suffixLen = data.size - (6 + pskLen)
+        val suffix = String(data, 6 + pskLen, suffixLen, Charsets.UTF_8)
+        val ssid = if (suffix.startsWith("DIRECT-")) suffix else "DIRECT-$suffix"
+
+        return "$ssid;$psk;$ip"
     }
 
     /**
@@ -150,6 +212,7 @@ object NativeWifiBridge {
             lastIncomingRequest = ""
             gattServer?.close()
 
+            // Optionaler GATT-Server als Fallback
             gattServer = btManager.openGattServer(ctx, object : BluetoothGattServerCallback() {
                 override fun onCharacteristicWriteRequest(
                     device: BluetoothDevice,
@@ -191,7 +254,6 @@ object NativeWifiBridge {
             })
 
             val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-
             val synChar = BluetoothGattCharacteristic(
                 SYN_CHAR_UUID,
                 BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
@@ -202,7 +264,6 @@ object NativeWifiBridge {
                 BluetoothGattCharacteristic.PROPERTY_READ,
                 BluetoothGattCharacteristic.PERMISSION_READ
             )
-
             service.addCharacteristic(synChar)
             service.addCharacteristic(ackChar)
             gattServer?.addService(service)
@@ -215,18 +276,62 @@ object NativeWifiBridge {
                 .setConnectable(true)
                 .build()
 
-            val data = AdvertiseData.Builder()
+            val dataBuilder = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addServiceUuid(serviceParcelUuid)
-                .build()
 
-            val scanResponse = AdvertiseData.Builder()
+            val scanResponseBuilder = AdvertiseData.Builder()
                 .setIncludeDeviceName(true)
-                .build()
 
-            advCallback = object : AdvertiseCallback() {}
+            // CRITICAL BLE LIMIT CHECK:
+            // Ein Legacy Advertising Paket hat maximal 31 Bytes.
+            // 128-Bit Service UUID braucht 18 Bytes.
+            // Manufacturer Data braucht 23-25 Bytes.
+            // Beide zusammen überschreiten 31 Bytes und führen sofort zu ADVERTISE_FAILED_DATA_TOO_LARGE!
+            // Daher: Wenn Manufacturer Data vorhanden ist, kommt sie in data und die Service UUID in scanResponse!
+            var hasManufacturerData = false
+            if (currentCredentials.contains(";")) {
+                val parts = currentCredentials.split(";")
+                if (parts.size >= 3) {
+                    val packed = packWifiCredentials(parts[0], parts[1], parts[2])
+                    if (packed != null) {
+                        println("Android BLE Advertising: Füge 0x5255 Manufacturer Data hinzu (${packed.size} Bytes)")
+                        dataBuilder.addManufacturerData(RUSTLE_COMPANY_ID, packed)
+                        hasManufacturerData = true
+                    }
+                }
+            }
+
+            if (!hasManufacturerData) {
+                // Client-Modus oder noch keine Creds: Service UUID ins Haupt-Werbepaket
+                dataBuilder.addServiceUuid(serviceParcelUuid)
+            } else {
+                // GO-Modus mit Creds: Service UUID in Scan Response
+                scanResponseBuilder.addServiceUuid(serviceParcelUuid)
+            }
+
+            val data = dataBuilder.build()
+            val scanResponse = scanResponseBuilder.build()
+
+            advCallback = object : AdvertiseCallback() {
+                override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                    println("Android BLE Advertising erfolgreich aktiv! (TxPower=${settingsInEffect?.txPowerLevel})")
+                }
+
+                override fun onStartFailure(errorCode: Int) {
+                    val reason = when (errorCode) {
+                        ADVERTISE_FAILED_DATA_TOO_LARGE -> "DATA_TOO_LARGE"
+                        ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "TOO_MANY_ADVERTISERS"
+                        ADVERTISE_FAILED_ALREADY_STARTED -> "ALREADY_STARTED"
+                        ADVERTISE_FAILED_INTERNAL_ERROR -> "INTERNAL_ERROR"
+                        ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "FEATURE_UNSUPPORTED"
+                        else -> "CODE_$errorCode"
+                    }
+                    println("Android BLE Advertising FEHLGESCHLAGEN: $reason ($errorCode)")
+                }
+            }
+
             advertiser?.startAdvertising(settings, data, scanResponse, advCallback)
-            "Android GO bereit ('$advName') - Hotspot aktiv & wartet auf Client..."
+            "Android GO bereit ('$advName') - Hotspot aktiv & werbung läuft..."
         } catch (e: Exception) {
             "ERR: ${e.message}"
         }
@@ -276,20 +381,42 @@ object NativeWifiBridge {
             ?: return "ERR: Scanner nicht bereit"
 
         val found = ConcurrentHashMap<String, String>()
-        //@Volatile
         var foundRustleGo = false
 
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device
                 discoveredBleDevices[dev.address] = dev
-                val name = result.scanRecord?.deviceName ?: dev.name ?: "<Unbekannt>"
+                val scanRec = result.scanRecord
+                val rawName = scanRec?.deviceName ?: dev.name ?: ""
                 val rssi = result.rssi
-                found[dev.address] = "${dev.address}|$name|$rssi"
-                val hasUuid = result.scanRecord?.serviceUuids?.contains(serviceParcelUuid) == true
-                if (name.startsWith("R_GO_") || hasUuid) {
+
+                // 1. Prüfe auf verbindungslose Wi-Fi Direct Zugangsdaten in Manufacturer Data
+                val manData = scanRec?.getManufacturerSpecificData(RUSTLE_COMPANY_ID)
+                var hasOurManData = false
+                if (manData != null) {
+                    val unpacked = unpackWifiCredentials(manData)
+                    if (unpacked != null) {
+                        println("Android BLE Scan: Manufacturer Data von ${dev.address} erhalten -> $unpacked")
+                        discoveredGoCredentials[dev.address] = unpacked
+                        foundRustleGo = true
+                        hasOurManData = true
+                    }
+                }
+
+                val hasUuid = scanRec?.serviceUuids?.contains(serviceParcelUuid) == true
+                if (rawName.startsWith("R_GO_") || hasUuid || hasOurManData) {
                     foundRustleGo = true
                 }
+
+                val finalName = when {
+                    rawName.isNotEmpty() -> rawName
+                    hasOurManData -> "R_GO_Peer"
+                    hasUuid -> "R_Peer"
+                    else -> "<Unbekannt>"
+                }
+
+                found[dev.address] = "${dev.address}|$finalName|$rssi"
             }
         }
 
@@ -316,7 +443,7 @@ object NativeWifiBridge {
 
     /**
      * Entfernt eine veraltete Bluetooth-Kopplung (Stale Bond), die bei BLE-Verbindungen
-     * sofort zu status=5 (GATT_INSUFFICIENT_AUTHENTICATION / HCI_ERR_AUTH_FAILURE) führt.
+     * sofort zu status=5 (GATT_INSUFFICIENT_AUTHENTICATION / HCI_ERR_AUTH_FAILURE) geführt hat.
      */
     private fun removeStaleBondIfNeeded(device: BluetoothDevice): Boolean {
         return try {
@@ -342,6 +469,25 @@ object NativeWifiBridge {
 
     @JvmStatic
     fun sendBleConnectionRequest(targetAddress: String, clientName: String): String {
+        // 1. FAST PATH: Connectionless BLE Handshake über Manufacturer Data (0ms!)
+        val cachedCreds = discoveredGoCredentials[targetAddress]
+        if (cachedCreds != null) {
+            println("Android BLE Handshake (Connectionless via Manufacturer Data): $cachedCreds sofort verfügbar für $targetAddress (0ms)!")
+            return cachedCreds
+        }
+
+        // Warte bis zu 600ms, falls das Scan-Ergebnis mit Manufacturer Data gerade eintrifft
+        for (w in 1..6) {
+            Thread.sleep(100)
+            val creds = discoveredGoCredentials[targetAddress]
+            if (creds != null) {
+                println("Android BLE Handshake (Connectionless nach ${w * 100}ms): $creds")
+                return creds
+            }
+        }
+
+        // 2. FALLBACK PATH: GATT-Verbindung (nur falls Manufacturer Data nicht vorhanden)
+        println("Android BLE Handshake: Manufacturer Data nicht im Cache -> Starte GATT Fallback zu $targetAddress...")
         val ctx = appContext ?: return "ERR: Kein Context"
         val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = btManager.adapter ?: return "ERR: Kein BT Adapter"
@@ -547,6 +693,38 @@ object NativeWifiBridge {
     @JvmStatic
     fun setBleHotspotCredentials(creds: String): String {
         currentCredentials = creds
+        // Falls Advertising bereits läuft, aktualisiere das Werbepaket mit Manufacturer Data
+        try {
+            val ctx = appContext ?: return "OK"
+            val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val adapter = btManager.adapter
+            val adv = advertiser ?: adapter?.bluetoothLeAdvertiser
+            if (adv != null && advCallback != null && creds.contains(";")) {
+                val parts = creds.split(";")
+                if (parts.size >= 3) {
+                    val packed = packWifiCredentials(parts[0], parts[1], parts[2])
+                    if (packed != null) {
+                        adv.stopAdvertising(advCallback)
+                        val settings = AdvertiseSettings.Builder()
+                            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                            .setConnectable(true)
+                            .build()
+                        val data = AdvertiseData.Builder()
+                            .setIncludeDeviceName(false)
+                            .addManufacturerData(RUSTLE_COMPANY_ID, packed)
+                            .build()
+                        val scanResponse = AdvertiseData.Builder()
+                            .setIncludeDeviceName(true)
+                            .addServiceUuid(serviceParcelUuid)
+                            .build()
+                        adv.startAdvertising(settings, data, scanResponse, advCallback)
+                        println("Android BLE Advertising mit Manufacturer Data aktualisiert: $creds")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            println("Hinweis beim Aktualisieren des BLE Advertisings: ${e.message}")
+        }
         return "OK"
     }
 
@@ -749,16 +927,16 @@ object NativeWifiBridge {
                     override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
                         hotspotReservation = reservation
                         val ssid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            reservation.softApConfiguration.ssid ?: "Android_GO"
+                            reservation.softApConfiguration.ssid ?: "DIRECT-AndGO"
                         } else {
                             @Suppress("DEPRECATION")
-                            reservation.wifiConfiguration?.SSID ?: "Android_GO"
+                            reservation.wifiConfiguration?.SSID ?: "DIRECT-AndGO"
                         }
                         val psk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            reservation.softApConfiguration.passphrase ?: ""
+                            reservation.softApConfiguration.passphrase ?: "rustle42"
                         } else {
                             @Suppress("DEPRECATION")
-                            reservation.wifiConfiguration?.preSharedKey ?: ""
+                            reservation.wifiConfiguration?.preSharedKey ?: "rustle42"
                         }
 
                         Thread {
@@ -834,8 +1012,8 @@ object NativeWifiBridge {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 val config = WifiP2pConfig.Builder()
-                    .setNetworkName("DIRECT-AndroidGO")
-                    .setPassphrase("password1234")
+                    .setNetworkName("DIRECT-AndGO")
+                    .setPassphrase("rustle42")
                     .enablePersistentMode(false)
                     .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
                     .build()
@@ -876,7 +1054,7 @@ object NativeWifiBridge {
 
         // WifiP2pManager.connect funktioniert nur mit einem echten Android Wi-Fi Direct GO (P2P Action Frames).
         // Ein Linux GO (NetworkManager AP) ist ein Standard 802.11 AP -> dafür MUSS WifiNetworkSpecifier verwendet werden!
-        val isAndroidP2pGo = ssid.contains("Android")
+        val isAndroidP2pGo = ssid.contains("Android") || ssid.contains("AndGO")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ssid.startsWith("DIRECT-") && isAndroidP2pGo) {
             val p2pPair = ensureP2pInitialized(context)
             if (p2pPair != null) {

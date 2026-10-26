@@ -12,7 +12,53 @@ import 'package:rustle/src/rust/transfer/progress.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
-  runApp(const MaterialApp(home: BleDiagnosticPage()));
+  runApp(const RustleApp());
+}
+
+class RustleApp extends StatelessWidget {
+  const RustleApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Rustle',
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0F172A), // Slate 900
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF38BDF8), // Sky 400
+          secondary: Color(0xFF818CF8), // Indigo 400
+          surface: Color(0xFF1E293B), // Slate 800
+          error: Color(0xFFF87171),
+        ),
+        cardTheme: CardThemeData(
+          color: const Color(0xFF1E293B),
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0xFF334155), width: 1),
+          ),
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF0F172A),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            elevation: 0,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+      ),
+      home: const BleDiagnosticPage(),
+    );
+  }
 }
 
 class BleDiagnosticPage extends StatefulWidget {
@@ -205,7 +251,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     setState(() {
       _busy = true;
       _activeProgress = null;
-      _status = '1/3 Sende Paket 2 an ${peer.name}...\n2/3 Lese Paket 3...\n3/3 Verbinde Wi-Fi Direct...';
+      _status = '1/3 Lese Zugangsdaten von ${peer.name}...\n2/3 Verbinde Wi-Fi Direct...';
     });
     try {
       final res = await bleHandshakeAndJoinWifi(
@@ -248,11 +294,17 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Rustle: Wi-Fi Direct File Sharing'),
+        title: Row(
+          children: const [
+            Icon(Icons.wifi_tethering, color: Color(0xFF38BDF8), size: 24),
+            SizedBox(width: 10),
+            Text('Rustle', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5)),
+          ],
+        ),
         actions: [
           IconButton(
             tooltip: 'Hotspot & BLE zurücksetzen (Normal-WLAN wiederherstellen)',
-            icon: const Icon(Icons.restore),
+            icon: const Icon(Icons.restore, color: Color(0xFF94A3B8)),
             onPressed: _busy ? null : _resetConnection,
           ),
         ],
@@ -262,37 +314,37 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // VPN-Warnhinweis oben am Bildschirm
+            // VPN-Warnhinweis oben am Bildschirm (abgestimmt auf Dark Mode)
             if (_activeVpn != null)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                 margin: const EdgeInsets.only(bottom: 12),
                 decoration: BoxDecoration(
-                  color: Colors.amber.shade100,
-                  border: Border.all(color: Colors.amber.shade700, width: 1.5),
-                  borderRadius: BorderRadius.circular(8),
+                  color: const Color(0xFF451A03), // Tiefes Amber
+                  border: Border.all(color: const Color(0xFFB45309), width: 1.2),
+                  borderRadius: BorderRadius.circular(10),
                 ),
                 child: Row(
                   children: [
-                    Icon(Icons.warning_amber_rounded, color: Colors.amber.shade900, size: 28),
+                    const Icon(Icons.warning_amber_rounded, color: Color(0xFFFBBF24), size: 26),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Achtung: Aktives VPN erkannt ($_activeVpn)!',
-                            style: TextStyle(
+                            'Aktives VPN erkannt ($_activeVpn)',
+                            style: const TextStyle(
                               fontWeight: FontWeight.bold,
-                              color: Colors.amber.shade900,
-                              fontSize: 14,
+                              color: Color(0xFFFDE68A),
+                              fontSize: 13,
                             ),
                           ),
                           const SizedBox(height: 2),
                           const Text(
-                            'Ein aktives VPN kann den lokalen Wi-Fi Direct Datenverkehr blockieren. '
-                            'Falls der Verbindungsaufbau oder TCP-Ping fehlschlägt, bitte das VPN oder dessen Killswitch vorübergehend pausieren.',
-                            style: TextStyle(fontSize: 12, color: Colors.black87),
+                            'Ein VPN kann den lokalen Wi-Fi Direct Datenverkehr stören. '
+                            'Bei Verbindungsproblemen bitte das VPN vorübergehend pausieren.',
+                            style: TextStyle(fontSize: 11.5, color: Color(0xFFFEF3C7)),
                           ),
                         ],
                       ),
@@ -301,55 +353,99 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                 ),
               ),
 
+            // Obere Steuerungs-Buttons
             Row(
               children: [
                 Expanded(
-                  child: ElevatedButton(
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0284C7), // Sky 600
+                      foregroundColor: Colors.white,
+                    ),
                     onPressed: _busy ? null : () => _advertise(true),
-                    child: const Text('1. Als GO warten'),
+                    icon: const Icon(Icons.router, size: 18),
+                    label: const Text('1. GO starten'),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: ElevatedButton(
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF4F46E5), // Indigo 600
+                      foregroundColor: Colors.white,
+                    ),
                     onPressed: _busy ? null : _scan,
-                    child: const Text('2. Als Client scannen'),
+                    icon: const Icon(Icons.search, size: 18),
+                    label: const Text('2. Scannen'),
                   ),
                 ),
                 const SizedBox(width: 8),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade100),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF7F1D1D), // Dark Red
+                    foregroundColor: const Color(0xFFFCA5A5),
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                  ),
                   onPressed: _busy ? null : _resetConnection,
-                  icon: const Icon(Icons.power_settings_new, size: 18),
-                  label: const Text('Reset'),
+                  child: const Icon(Icons.power_settings_new, size: 18),
                 ),
               ],
             ),
             const SizedBox(height: 12),
+
+            // GO Event Banner (Dark Green)
             if (_goEventBanner != null)
               Container(
                 padding: const EdgeInsets.all(12),
                 margin: const EdgeInsets.only(bottom: 12),
-                color: Colors.green.shade100,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF064E3B), // Deep Emerald
+                  border: Border.all(color: const Color(0xFF059669), width: 1.2),
+                  borderRadius: BorderRadius.circular(10),
+                ),
                 child: Text(
                   _goEventBanner!,
-                  style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF6EE7B7),
+                    fontSize: 13,
+                  ),
                 ),
               ),
+
+            // Status Terminal Box
             Container(
-              padding: const EdgeInsets.all(10),
-              color: Colors.black12,
-              child: Text(_status, style: const TextStyle(fontFamily: 'monospace')),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF020617), // Fast Schwarz Slate 950
+                border: Border.all(color: const Color(0xFF334155), width: 1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.terminal, color: Color(0xFF64748B), size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _status,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        color: Color(0xFF94A3B8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 8),
-            // Live Fortschrittsanzeige für Dateiübertragung
+
+            // Live Fortschrittsanzeige für Dateiübertragung (Dark Mode)
             if (_activeProgress != null)
               Card(
-                color: Colors.blue.shade50,
-                elevation: 3,
                 margin: const EdgeInsets.symmetric(vertical: 8),
                 child: Padding(
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(14),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -362,14 +458,16 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                                 _activeProgress!.isFinished
                                     ? Icons.check_circle
                                     : Icons.swap_vert_circle,
-                                color: _activeProgress!.isFinished ? Colors.green : Colors.blue,
+                                color: _activeProgress!.isFinished
+                                    ? const Color(0xFF34D399)
+                                    : const Color(0xFF38BDF8),
                               ),
                               const SizedBox(width: 8),
                               Text(
                                 _activeProgress!.isFinished
                                     ? 'Transfer abgeschlossen!'
                                     : 'Übertragung aktiv...',
-                                style: const TextStyle(fontWeight: FontWeight.bold),
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                               ),
                             ],
                           ),
@@ -378,34 +476,38 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                             style: const TextStyle(
                               fontWeight: FontWeight.bold,
                               fontSize: 16,
-                              color: Colors.blue,
+                              color: Color(0xFF38BDF8),
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 8),
-                      LinearProgressIndicator(
-                        value: _activeProgress!.isFinished
-                            ? 1.0
-                            : (_activeProgress!.progressPercent / 100.0).clamp(0.0, 1.0),
-                        minHeight: 8,
-                        backgroundColor: Colors.blue.shade100,
+                      const SizedBox(height: 10),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: _activeProgress!.isFinished
+                              ? 1.0
+                              : (_activeProgress!.progressPercent / 100.0).clamp(0.0, 1.0),
+                          minHeight: 6,
+                          backgroundColor: const Color(0xFF334155),
+                          valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
+                        ),
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 10),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           Text(
                             '${(_activeProgress!.bytesTransferred.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB / ${(_activeProgress!.totalBytes.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB',
-                            style: const TextStyle(fontSize: 12),
+                            style: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
                           ),
                           Text(
                             '${(_activeProgress!.speedBytesPerSec.toDouble() / (1024 * 1024)).toStringAsFixed(1)} MB/s',
-                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.indigo),
+                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF818CF8)),
                           ),
                           Text(
-                            'Chunk: ${_activeProgress!.currentChunk}/${_activeProgress!.totalChunks} (ETA: ${_activeProgress!.etaSeconds}s)',
-                            style: const TextStyle(fontSize: 12),
+                            'Chunk: ${_activeProgress!.currentChunk}/${_activeProgress!.totalChunks}',
+                            style: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
                           ),
                         ],
                       ),
@@ -413,12 +515,17 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                   ),
                 ),
               ),
+
+            // Aktions-Buttons: Ping & Datei senden
             Row(
               children: [
                 Expanded(
                   child: ElevatedButton.icon(
-                    icon: const Icon(Icons.bolt),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade100),
+                    icon: const Icon(Icons.bolt, size: 18),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF92400E), // Warmes Bernstein/Amber
+                      foregroundColor: const Color(0xFFFDE68A),
+                    ),
                     onPressed: _busy
                         ? null
                         : () async {
@@ -437,14 +544,17 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                               setState(() => _busy = false);
                             }
                           },
-                    label: const Text('3. Test-Ping (TCP :4242)'),
+                    label: const Text('3. TCP-Ping (:4242)'),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton.icon(
-                    icon: const Icon(Icons.upload_file),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade100),
+                    icon: const Icon(Icons.upload_file, size: 18),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0F766E), // Teal 700
+                      foregroundColor: const Color(0xFFCCFBF1),
+                    ),
                     onPressed: _busy ? null : _pickAndSendFile,
                     label: const Text('4. Datei senden (:4243)'),
                   ),
@@ -453,29 +563,63 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
             ),
             const SizedBox(height: 16),
             const Text(
-              'Gefundene Geräte (Antippen für automatischen BLE -> Wi-Fi Connect):',
-              style: TextStyle(fontWeight: FontWeight.bold),
+              'Gefundene Geräte (Tippen zum Verbinden):',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFCBD5E1)),
             ),
-            const Divider(),
+            const SizedBox(height: 6),
             Expanded(
-              child: ListView.builder(
-                itemCount: _peers.length,
-                itemBuilder: (ctx, i) {
-                  final p = _peers[i];
-                  return Card(
-                    child: ListTile(
-                      leading: Icon(
-                        p.isGo ? Icons.router : Icons.bluetooth,
-                        color: p.isGo ? Colors.green : Colors.blue,
+              child: _peers.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: const [
+                          Icon(Icons.bluetooth_searching, size: 40, color: Color(0xFF475569)),
+                          SizedBox(height: 8),
+                          Text(
+                            'Keine Geräte gefunden.\nTippe auf "2. Scannen", um nach Peers zu suchen.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                          ),
+                        ],
                       ),
-                      title: Text('${p.name} (${p.isGo ? "GO" : "Andere"})'),
-                      subtitle: Text('MAC: ${p.address} | RSSI: ${p.rssi} dBm'),
-                      trailing: const Icon(Icons.wifi_tethering),
-                      onTap: _busy ? null : () => _startFullHandshake(p),
+                    )
+                  : ListView.builder(
+                      itemCount: _peers.length,
+                      itemBuilder: (ctx, i) {
+                        final p = _peers[i];
+                        return Card(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          child: ListTile(
+                            leading: Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: p.isGo
+                                    ? const Color(0xFF064E3B)
+                                    : const Color(0xFF1E3A8A),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Icon(
+                                p.isGo ? Icons.router : Icons.bluetooth,
+                                color: p.isGo
+                                    ? const Color(0xFF34D399)
+                                    : const Color(0xFF60A5FA),
+                                size: 20,
+                              ),
+                            ),
+                            title: Text(
+                              '${p.name} ${p.isGo ? "(GO)" : ""}',
+                              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                            ),
+                            subtitle: Text(
+                              'MAC: ${p.address} | RSSI: ${p.rssi} dBm',
+                              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11.5),
+                            ),
+                            trailing: const Icon(Icons.wifi_tethering, color: Color(0xFF38BDF8), size: 20),
+                            onTap: _busy ? null : () => _startFullHandshake(p),
+                          ),
+                        );
+                      },
                     ),
-                  );
-                },
-              ),
             ),
           ],
         ),

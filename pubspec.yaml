@@ -26,6 +26,17 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   integration_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.4
 
 flutter:
   uses-material-design: true
+
+flutter_launcher_icons:
+  image_path: "assets/icons/Leaves2.png"
+  linux: true
+
+  android: true
+  adaptive_icon_background: "#0f1117ff"
+  adaptive_icon_foreground: "assets/icons/Leaves2-noBG.png"
+  adaptive_icon_monochrome: "assets/icons/Leaves-Lawnicons.png"
+

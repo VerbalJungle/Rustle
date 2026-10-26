@@ -55,12 +55,12 @@ pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, S
         *PEER_IP.lock().unwrap() = None;
         OUTGOING_TCP_QUEUE.lock().unwrap().clear();
 
-        // PRE-WARMING: Starte den Wi-Fi Direct GO (Hotspot) direkt beim Aktivieren des GO-Modus
-        // und hinterlege Paket 3 (SSID;PSK;IP) sofort im GATT-Server!
+        // PRE-WARMING: Startet den Wi-Fi Direct GO (Hotspot) direkt beim Aktivieren des GO-Modus
+        // und hinterlege die Zugangsdaten (SSID;PSK;IP) im GATT-Server & BLE Advertising!
         let prewarmed_creds = {
             let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
             let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
-            w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?
+            w_mgr.start_hotspot("DIRECT-RustleGO".into(), "rustle42".into())?
         };
 
         if !prewarmed_creds.starts_with("ERR:") {
@@ -123,7 +123,7 @@ pub fn ble_scan(duration_secs: u64) -> Result<Vec<DiscoveredPeer>, String> {
     }
 }
 
-/// Auf dem GO: Prüft auf Paket 2 -> Stellt sicher, dass Paket 3 (DIRECT-...;PSK;IP) bereitsteht
+/// Auf dem GO: Prüft auf eingehende Anfragen -> Stellt sicher, dass Zugangsdaten bereitstehen
 pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     let incoming = {
         let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -142,14 +142,14 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
             _ => {
                 let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
                 let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
-                let c = w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?;
+                let c = w_mgr.start_hotspot("DIRECT-RustleGO".into(), "rustle42".into())?;
                 if c.starts_with("ERR:") {
                     return Err(c);
                 }
                 *ACTIVE_GO_CREDS.lock().unwrap() = Some(c.clone());
                 let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
                 if let Some(ref mut mgr) = *ble {
-                    mgr.set_hotspot_credentials(&c)?
+                    mgr.set_hotspot_credentials(&c)?;
                 }
                 c
             }
@@ -164,7 +164,7 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Auf dem Client: Sendet Paket 2 -> Empfängt Paket 3 (SSID;PSK;IP) -> Verbindet Wi-Fi Direct
+/// Auf dem Client: Sendet Anfrage / holt Zugangsdaten (Connectionless BLE Handshake) -> Verbindet Wi-Fi Direct
 pub fn ble_handshake_and_join_wifi(
     target_address: String,
     client_name: String,
@@ -184,7 +184,7 @@ pub fn ble_handshake_and_join_wifi(
 
     let parts: Vec<&str> = creds.split(';').collect();
     if parts.len() < 2 {
-        return Err(format!("Ungültiges Paket 3 empfangen: {}", creds));
+        return Err(format!("Ungültige Zugangsdaten empfangen: {}", creds));
     }
 
     let ssid = parts[0].trim().to_string();

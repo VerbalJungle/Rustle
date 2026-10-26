@@ -33,11 +33,11 @@ Future<String> bleStopBroadcast() =>
 Future<List<DiscoveredPeer>> bleScan({required BigInt durationSecs}) =>
     RustLib.instance.api.crateApiWifiBleScan(durationSecs: durationSecs);
 
-/// Auf dem GO: Prüft auf Paket 2 -> Stellt sicher, dass Paket 3 (DIRECT-...;PSK;IP) bereitsteht
+/// Auf dem GO: Prüft auf eingehende Anfragen -> Stellt sicher, dass Zugangsdaten bereitstehen
 Future<String?> blePollAndHandleGo() =>
     RustLib.instance.api.crateApiWifiBlePollAndHandleGo();
 
-/// Auf dem Client: Sendet Paket 2 -> Empfängt Paket 3 (SSID;PSK;IP) -> Verbindet Wi-Fi Direct
+/// Auf dem Client: Sendet Anfrage / holt Zugangsdaten (Connectionless BLE Handshake) -> Verbindet Wi-Fi Direct
 Future<String> bleHandshakeAndJoinWifi({
   required String targetAddress,
   required String clientName,
