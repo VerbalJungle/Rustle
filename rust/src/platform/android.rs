@@ -39,6 +39,59 @@ fn call_kotlin_bridge(method_name: &str, sig: &str, args: &[JValue]) -> Result<S
     Ok(rust_str)
 }
 
+pub fn check_active_vpn_platform() -> Result<Option<String>, String> {
+    let res = call_kotlin_bridge("getActiveVpnName", "()Ljava/lang/String;", &[])?;
+    if res.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(res))
+    }
+}
+
+pub fn create_connected_wifi_stream(
+    target_ip: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<std::net::TcpStream, String> {
+    use std::os::fd::FromRawFd;
+
+    let vm = JVM.get().ok_or("JavaVM fehlt")?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let class_ref = BRIDGE_CLASS.get().ok_or("Bridge-Klasse fehlt")?;
+    let class: &JClass = class_ref.as_obj().into();
+
+    let j_ip = env.new_string(target_ip).map_err(|e| e.to_string())?;
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+    let res = env.call_static_method(
+        class,
+        "openConnectedWifiSocket",
+        "(Ljava/lang/String;II)I",
+        &[
+            JValue::Object(&j_ip),
+            JValue::Int(port as i32),
+            JValue::Int(timeout_ms),
+        ],
+    );
+
+    match res {
+        Ok(val) => {
+            let fd = val.i().map_err(|e| e.to_string())?;
+            if fd < 0 {
+                return Err(format!("Ungültiger File Descriptor: {}", fd));
+            }
+            let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+            stream.set_read_timeout(Some(timeout)).ok();
+            stream.set_write_timeout(Some(timeout)).ok();
+            Ok(stream)
+        }
+        Err(e) => {
+            let _ = env.exception_clear();
+            Err(format!("Android Wi-Fi Socket Connect fehlgeschlagen: {}", e))
+        }
+    }
+}
+
 pub struct WifiDirectManager;
 impl WifiDirectManager { pub fn new() -> Self { Self } }
 
@@ -58,6 +111,9 @@ impl WifiDirectDevice for WifiDirectManager {
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             &[JValue::Object(&j_ssid), JValue::Object(&j_psk)],
         )
+    }
+    fn stop_hotspot(&mut self) -> Result<String, String> {
+        call_kotlin_bridge("stopWifiDirectAndHotspot", "()Ljava/lang/String;", &[])
     }
 }
 
@@ -112,44 +168,44 @@ impl BleDevice for AndroidBleManager {
     }
 
     fn send_connection_request(&mut self, target_address: &str, client_name: &str) -> Result<String, String> {
-            let vm = JVM.get().ok_or("JavaVM fehlt")?;
-            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-            let j_addr = env.new_string(target_address).map_err(|e| e.to_string())?;
-            let j_name = env.new_string(client_name).map_err(|e| e.to_string())?;
+        let vm = JVM.get().ok_or("JavaVM fehlt")?;
+        let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+        let j_addr = env.new_string(target_address).map_err(|e| e.to_string())?;
+        let j_name = env.new_string(client_name).map_err(|e| e.to_string())?;
 
-            let res = call_kotlin_bridge(
-                "sendBleConnectionRequest",
-                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&j_addr), JValue::Object(&j_name)],
-            )?;
+        let res = call_kotlin_bridge(
+            "sendBleConnectionRequest",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[JValue::Object(&j_addr), JValue::Object(&j_name)],
+        )?;
 
-            if res.starts_with("ERR:") {
-                Err(res)
-            } else {
-                Ok(res)
-            }
+        if res.starts_with("ERR:") {
+            Err(res)
+        } else {
+            Ok(res)
+        }
     }
 
     fn poll_incoming_request(&mut self) -> Result<Option<String>, String> {
-            let res = call_kotlin_bridge("pollIncomingBleRequest", "()Ljava/lang/String;", &[])?;
-            if res.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(res))
-            }
+        let res = call_kotlin_bridge("pollIncomingBleRequest", "()Ljava/lang/String;", &[])?;
+        if res.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(res))
+        }
     }
 
     fn set_hotspot_credentials(&mut self, credentials: &str) -> Result<(), String> {
-            let vm = JVM.get().ok_or("JavaVM fehlt")?;
-            let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-            let j_creds = env.new_string(credentials).map_err(|e| e.to_string())?;
+        let vm = JVM.get().ok_or("JavaVM fehlt")?;
+        let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+        let j_creds = env.new_string(credentials).map_err(|e| e.to_string())?;
 
-            call_kotlin_bridge(
-                "setBleHotspotCredentials",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&j_creds)],
-            )?;
-            Ok(())
+        call_kotlin_bridge(
+            "setBleHotspotCredentials",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[JValue::Object(&j_creds)],
+        )?;
+        Ok(())
     }
 }
 
@@ -168,6 +224,33 @@ pub fn send_tcp_packet_platform(target_ip: &str, port: u16, message: &str) -> Re
             JValue::Int(port as i32),
             JValue::Object(&j_msg),
         ],
+    )?;
+
+    if res.starts_with("ERR:") {
+        Err(res)
+    } else {
+        Ok(res)
+    }
+}
+
+pub fn export_file_to_downloads_platform(file_path: &std::path::Path) -> Result<String, String> {
+    let vm = JVM.get().ok_or("JavaVM fehlt")?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+
+    let path_str = file_path.to_string_lossy().to_string();
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("received_file.bin")
+        .to_string();
+
+    let j_path = env.new_string(&path_str).map_err(|e| e.to_string())?;
+    let j_name = env.new_string(&file_name).map_err(|e| e.to_string())?;
+
+    let res = call_kotlin_bridge(
+        "exportFileToDownloads",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        &[JValue::Object(&j_path), JValue::Object(&j_name)],
     )?;
 
     if res.starts_with("ERR:") {

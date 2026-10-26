@@ -3,6 +3,7 @@ package com.example.rustle
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
+import android.content.ContentValues
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
@@ -14,9 +15,15 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.ParcelUuid
+import android.provider.MediaStore
+import android.webkit.MimeTypeMap
+import java.io.File
+import java.io.FileInputStream
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
@@ -90,6 +97,44 @@ object NativeWifiBridge {
         return Pair(mgr, ch)
     }
 
+    /**
+     * Erkennt, ob auf Android ein aktives VPN läuft (Mullvad, Proton, Wireguard, NordVPN etc.)
+     * und gibt den Namen des VPN-Interfaces bzw. "VPN" zurück.
+     */
+    @JvmStatic
+    fun getActiveVpnName(): String {
+        val ctx = appContext ?: return ""
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            for (net in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(net) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    val lp = cm.getLinkProperties(net)
+                    val ifName = lp?.interfaceName ?: "VPN"
+                    return ifName
+                }
+            }
+        } catch (_: Exception) {}
+
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return ""
+            for (intf in interfaces) {
+                if (!intf.isUp || intf.isLoopback) continue
+                val n = intf.name.lowercase()
+                if (n.startsWith("wlan") || n.startsWith("p2p") || n.startsWith("rmnet") || n.startsWith("dummy")) {
+                    continue
+                }
+                if (n.startsWith("tun") || n.startsWith("tap") || n.startsWith("wg") ||
+                    n.startsWith("proton") || n.startsWith("nord") || n.startsWith("ivpn") ||
+                    n.startsWith("surfshark") || n.startsWith("windscribe") || n.startsWith("xvpn")) {
+                    return intf.name
+                }
+            }
+        } catch (_: Exception) {}
+
+        return ""
+    }
+
     @JvmStatic
     fun startBleAdvertising(advName: String): String {
         val ctx = appContext ?: return "ERR: Kein Context"
@@ -103,7 +148,6 @@ object NativeWifiBridge {
             }
 
             lastIncomingRequest = ""
-            currentCredentials = ""
             gattServer?.close()
 
             gattServer = btManager.openGattServer(ctx, object : BluetoothGattServerCallback() {
@@ -182,7 +226,7 @@ object NativeWifiBridge {
 
             advCallback = object : AdvertiseCallback() {}
             advertiser?.startAdvertising(settings, data, scanResponse, advCallback)
-            "Android GO bereit ('$advName') - Wartet auf Paket 2..."
+            "Android GO bereit ('$advName') - Hotspot aktiv & wartet auf Client..."
         } catch (e: Exception) {
             "ERR: ${e.message}"
         }
@@ -197,6 +241,34 @@ object NativeWifiBridge {
     }
 
     @JvmStatic
+    fun stopWifiDirectAndHotspot(): String {
+        val ctx = appContext ?: return "OK"
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            activeNetworkCallback?.let {
+                try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {}
+            }
+            activeNetworkCallback = null
+            activeWifiNetwork = null
+            try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+
+            hotspotReservation?.close()
+            hotspotReservation = null
+            currentHotspotIp = ""
+            currentCredentials = ""
+
+            val p2pPair = ensureP2pInitialized(ctx)
+            if (p2pPair != null) {
+                val (mgr, ch) = p2pPair
+                mgr.cancelConnect(ch, null)
+                mgr.removeGroup(ch, null)
+            }
+        } catch (_: Exception) {
+        }
+        return "Wi-Fi Direct / Hotspot zurückgesetzt"
+    }
+
+    @JvmStatic
     fun scanBlePeers(durationSecs: Int): String {
         val ctx = appContext ?: return "ERR: Kein Context"
         val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -204,6 +276,9 @@ object NativeWifiBridge {
             ?: return "ERR: Scanner nicht bereit"
 
         val found = ConcurrentHashMap<String, String>()
+        //@Volatile
+        var foundRustleGo = false
+
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device
@@ -211,6 +286,10 @@ object NativeWifiBridge {
                 val name = result.scanRecord?.deviceName ?: dev.name ?: "<Unbekannt>"
                 val rssi = result.rssi
                 found[dev.address] = "${dev.address}|$name|$rssi"
+                val hasUuid = result.scanRecord?.serviceUuids?.contains(serviceParcelUuid) == true
+                if (name.startsWith("R_GO_") || hasUuid) {
+                    foundRustleGo = true
+                }
             }
         }
 
@@ -219,7 +298,17 @@ object NativeWifiBridge {
             .build()
 
         scanner.startScan(null, scanSettings, callback)
-        Thread.sleep(durationSecs * 1000L)
+
+        // Smart Early-Exit: Sobald ein Rustle GO gefunden wurde (mindestens 450ms gescannt),
+        // kehren wir sofort zurück statt volle 4 Sekunden zu warten!
+        val maxSteps = ((durationSecs * 1000L) / 150L).coerceAtLeast(3L)
+        for (step in 1..maxSteps) {
+            Thread.sleep(150L)
+            if (step >= 3 && foundRustleGo) {
+                println("Android BLE Scan: Rustle GO bereits nach ${step * 150}ms gefunden -> Beende Scan vorzeitig!")
+                break
+            }
+        }
         scanner.stopScan(callback)
 
         return found.values.joinToString(System.lineSeparator())
@@ -257,7 +346,6 @@ object NativeWifiBridge {
         val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = btManager.adapter ?: return "ERR: Kein BT Adapter"
 
-        // Falls noch ein BLE-Scan im Hintergrund aktiv ist, kurz sicherstellen, dass der Controller frei ist
         try {
             adapter.bluetoothLeScanner?.flushPendingScanResults(object : ScanCallback() {})
         } catch (_: Exception) {
@@ -269,13 +357,10 @@ object NativeWifiBridge {
             return "ERR: Ungültige MAC-Adresse: ${e.message}"
         }
 
-        // Falls das Zielgerät in Android als "Gekoppelt" (BOND_BONDED = 12) oder "Koppelnd" (11)
-        // hinterlegt ist, schlägt eine unverschlüsselte BLE-GATT-Verbindung mit status=5 fehl,
-        // wenn der Linux-PC keinen passenden Link-Key (mehr) hat.
         if (device.bondState != BluetoothDevice.BOND_NONE) {
             println("Bestehende Kopplung (bondState=${device.bondState}) zu $targetAddress erkannt -> Bereinige vor BLE-Connect...")
             if (removeStaleBondIfNeeded(device)) {
-                try { Thread.sleep(1000) } catch (_: Exception) {}
+                try { Thread.sleep(800) } catch (_: Exception) {}
             }
         }
 
@@ -301,7 +386,7 @@ object NativeWifiBridge {
                     if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                         isCurrentlyConnected = true
                         Thread {
-                            try { Thread.sleep(150) } catch (_: Exception) {}
+                            try { Thread.sleep(80) } catch (_: Exception) {}
                             if (isCurrentlyConnected && !future.isDone) {
                                 val ok = gatt.discoverServices()
                                 println("discoverServices gestartet: $ok")
@@ -315,15 +400,11 @@ object NativeWifiBridge {
                         gatt.close()
 
                         if (status != BluetoothGatt.GATT_SUCCESS && connectAttempt < maxConnectAttempts && !future.isDone) {
-                            // Bei status=5 (GATT_INSUFFICIENT_AUTHENTICATION / HCI_ERR_AUTH_FAILURE) oder 137:
-                            // Veralteten Bond auf Android-Seite aktiv löschen!
                             if (status == 5 || status == 8 || status == 137 || device.bondState != BluetoothDevice.BOND_NONE) {
                                 println("BLE Auth-Fehler (status=$status) -> Entferne veraltete Kopplung (removeBond)...")
                                 removeStaleBondIfNeeded(device)
                             }
-                            // Genug Pause lassen (1500ms), damit der Bluetooth-Controller den vorherigen
-                            // Verbindungsversuch sauber abbaut und nicht mit status=147 / 133 antwortet!
-                            val waitMs = 1500L
+                            val waitMs = 1200L
                             println("BLE Disconnect mit status=$status -> Erneuter Versuch in ${waitMs}ms...")
                             Thread {
                                 try { Thread.sleep(waitMs) } catch (_: Exception) {}
@@ -373,21 +454,23 @@ object NativeWifiBridge {
                 ) {
                     println("BLE onCharacteristicWrite: status=$status")
                     if (status == BluetoothGatt.GATT_SUCCESS) {
-                        pollAckCharacteristic(gatt)
+                        pollAckCharacteristic(gatt, immediate = true)
                     } else {
                         future.complete("ERR: Schreiben von Paket 2 fehlgeschlagen ($status)")
                         gatt.disconnect()
                     }
                 }
 
-                private fun pollAckCharacteristic(gatt: BluetoothGatt) {
+                private fun pollAckCharacteristic(gatt: BluetoothGatt, immediate: Boolean = false) {
                     val ackChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(ACK_CHAR_UUID)
                     if (ackChar == null) {
                         future.complete("ERR: ACK-Charakteristik auf GO fehlt")
                         gatt.disconnect()
                         return
                     }
-                    Thread.sleep(500)
+                    if (!immediate) {
+                        Thread.sleep(150)
+                    }
                     gatt.readCharacteristic(ackChar)
                 }
 
@@ -421,8 +504,8 @@ object NativeWifiBridge {
                         }
                     }
                     ackReadAttempts++
-                    if (ackReadAttempts < 30) {
-                        pollAckCharacteristic(gatt)
+                    if (ackReadAttempts < 60) {
+                        pollAckCharacteristic(gatt, immediate = false)
                     } else {
                         future.complete("ERR: Timeout beim Warten auf Paket 3 (Hotspot-Daten)")
                         gatt.disconnect()
@@ -430,7 +513,6 @@ object NativeWifiBridge {
                 }
             }
 
-            // Auf dem Main-Looper starten (verhindert Race-Conditions in manchen Android BLE-Stacks)
             Handler(Looper.getMainLooper()).post {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     device.connectGatt(
@@ -449,7 +531,7 @@ object NativeWifiBridge {
         attemptGattConnect()
 
         return try {
-            future.get(30, TimeUnit.SECONDS)
+            future.get(25, TimeUnit.SECONDS)
         } catch (e: Exception) {
             "ERR: Timeout: ${e.message}"
         }
@@ -570,6 +652,48 @@ object NativeWifiBridge {
     }
 
     /**
+     * Ermittelt das Network-Objekt für das Ziel-Subnetz,
+     * damit Sockets per network.bindSocket(...) direkt darüber geroutet werden
+     * und nicht im Standard-WLAN/Mobilfunknetzwerk oder VPN verloren gehen.
+     */
+    private fun findNetworkForInterfaceOrIp(targetIp: String): Network? {
+        val ctx = appContext ?: return null
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val targetParts = targetIp.trim().split(".")
+            val targetPrefix = if (targetParts.size == 4) "${targetParts[0]}.${targetParts[1]}.${targetParts[2]}." else null
+
+            // 1. Priorität: Ein Netzwerk, dessen LinkAddress im selben /24 Subnetz wie targetIp liegt
+            if (targetPrefix != null) {
+                for (net in cm.allNetworks) {
+                    val lp = cm.getLinkProperties(net) ?: continue
+                    for (la in lp.linkAddresses) {
+                        val addr = la.address
+                        if (addr is Inet4Address) {
+                            val host = addr.hostAddress ?: ""
+                            if (host.startsWith(targetPrefix)) {
+                                return net
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Nur wenn targetIp im 192.168.49.x Subnetz liegt, ein P2P-Interface zurückgeben
+            if (targetIp.startsWith("192.168.49.")) {
+                for (net in cm.allNetworks) {
+                    val lp = cm.getLinkProperties(net) ?: continue
+                    val ifName = lp.interfaceName?.lowercase() ?: ""
+                    if (ifName.startsWith("p2p") || ifName.contains("p2p")) {
+                        return net
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /**
      * Startet auf Android einen echten Wi-Fi Direct Autonomous Group Owner via WifiP2pManager.createGroup()!
      */
     @JvmStatic
@@ -579,6 +703,11 @@ object NativeWifiBridge {
 
         activeWifiNetwork = null
         try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+
+        // Falls bereits eine P2P-Gruppe aktiv ist und Credentials vorliegen, direkt wiederverwenden!
+        if (currentCredentials.contains(";") && findLocalIpInSameSubnet("192.168.49.1") != null) {
+            return currentCredentials
+        }
 
         val existingClientIps = getActiveWifiClientIps()
 
@@ -598,12 +727,13 @@ object NativeWifiBridge {
             })
 
             val p2pRes = try {
-                p2pFuture.get(12, TimeUnit.SECONDS)
+                p2pFuture.get(10, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 "ERR: P2P Timeout"
             }
 
             if (!p2pRes.startsWith("ERR:")) {
+                currentCredentials = p2pRes
                 return p2pRes
             }
             println("WifiP2pManager.createGroup Hinweis ($p2pRes) -> Falle zurück auf LocalOnlyHotspot...")
@@ -634,15 +764,17 @@ object NativeWifiBridge {
                         Thread {
                             var ip: String? = null
                             var attempts = 0
-                            while (ip == null && attempts < 15) {
-                                Thread.sleep(250)
+                            while (ip == null && attempts < 20) {
+                                Thread.sleep(100)
                                 ip = resolveHotspotIp(existingClientIps)
                                 attempts++
                             }
                             val finalIp = ip ?: resolveHotspotIp(emptySet()) ?: "192.168.43.1"
                             currentHotspotIp = finalIp
+                            val creds = "${ssid.removeSurrounding("\"")};$psk;$finalIp"
+                            currentCredentials = creds
                             println("LocalOnlyHotspot bereit! SSID=$ssid, PSK=$psk, IP=$finalIp")
-                            future.complete("${ssid.removeSurrounding("\"")};$psk;$finalIp")
+                            future.complete(creds)
                         }.start()
                     }
 
@@ -656,7 +788,7 @@ object NativeWifiBridge {
         }
 
         return try {
-            future.get(15, TimeUnit.SECONDS)
+            future.get(12, TimeUnit.SECONDS)
         } catch (e: Exception) {
             "ERR: Hotspot Timeout"
         }
@@ -671,9 +803,9 @@ object NativeWifiBridge {
         val createdListener = object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Thread {
-                    for (attempt in 1..20) {
+                    for (attempt in 1..40) {
                         if (future.isDone) break
-                        Thread.sleep(300)
+                        Thread.sleep(100)
                         mgr.requestGroupInfo(ch) { group ->
                             if (group != null && !group.networkName.isNullOrEmpty() && !group.passphrase.isNullOrEmpty()) {
                                 val ssid = group.networkName.removeSurrounding("\"")
@@ -716,7 +848,7 @@ object NativeWifiBridge {
     }
 
     /**
-     * Verbindet Android als Client mit dem GO:
+     * Verbindet Android als Client mit dem GO.
      */
     @JvmStatic
     fun connectToSpecifier(ssid: String, psk: String): String {
@@ -726,31 +858,26 @@ object NativeWifiBridge {
 
         println("connectToSpecifier aufgerufen: SSID='$ssid', PSK='$psk'")
 
-        if (findLocalIpInSameSubnet("10.42.0.1") != null || findLocalIpInSameSubnet("192.168.49.1") != null) {
-            println("Bereits über lokales P2P/Subnetz-Interface mit '$ssid' verbunden!")
-            return "Erfolgreich per Wi-Fi Direct mit '$ssid' verbunden (Heim-WLAN bleibt aktiv)!"
+        // Vor jedem neuen Verbindungsaufbau: Alten Hotspot/P2P-Status bereinigen
+        stopWifiDirectAndHotspot()
+
+        // Sofortiger Blick in den vorhandenen Scan-Cache
+        val matchedScan: WifiScanResult? = try {
+            @Suppress("DEPRECATION")
+            wifiManager.startScan()
+            wifiManager.scanResults?.firstOrNull {
+                @Suppress("DEPRECATION")
+                val rSsid = it.SSID?.removeSurrounding("\"") ?: ""
+                rSsid == ssid
+            }
+        } catch (_: Exception) {
+            null
         }
 
-        var matchedScan: WifiScanResult? = null
-        try {
-            for (attempt in 1..6) {
-                @Suppress("DEPRECATION")
-                wifiManager.startScan()
-                val results = wifiManager.scanResults ?: emptyList()
-                matchedScan = results.firstOrNull {
-                    @Suppress("DEPRECATION")
-                    val rSsid = it.SSID?.removeSurrounding("\"") ?: ""
-                    rSsid == ssid
-                }
-                if (matchedScan != null) {
-                    println("Ziel-GO '$ssid' im Scan gefunden (Versuch $attempt): BSSID=${matchedScan.BSSID}, Freq=${matchedScan.frequency}MHz, Caps=${matchedScan.capabilities}")
-                    break
-                }
-                Thread.sleep(800)
-            }
-        } catch (_: Exception) {}
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ssid.startsWith("DIRECT-")) {
+        // WifiP2pManager.connect funktioniert nur mit einem echten Android Wi-Fi Direct GO (P2P Action Frames).
+        // Ein Linux GO (NetworkManager AP) ist ein Standard 802.11 AP -> dafür MUSS WifiNetworkSpecifier verwendet werden!
+        val isAndroidP2pGo = ssid.contains("Android")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ssid.startsWith("DIRECT-") && isAndroidP2pGo) {
             val p2pPair = ensureP2pInitialized(context)
             if (p2pPair != null) {
                 val (mgr, ch) = p2pPair
@@ -767,7 +894,7 @@ object NativeWifiBridge {
                 })
 
                 val p2pRes = try {
-                    p2pFuture.get(16, TimeUnit.SECONDS)
+                    p2pFuture.get(12, TimeUnit.SECONDS)
                 } catch (e: Exception) {
                     "TIMEOUT"
                 }
@@ -806,14 +933,14 @@ object NativeWifiBridge {
                     val bound = cm.bindProcessToNetwork(network)
                     println("onAvailable: Netzwerk=$network, bindProcess=$bound")
                     Thread {
-                        for (i in 1..25) {
+                        for (i in 1..40) {
                             val lp = cm.getLinkProperties(network)
                             val hasIpv4 = lp?.linkAddresses?.any { it.address is Inet4Address } == true
                             if (hasIpv4) {
-                                println("DHCP IPv4 bereit nach ${i * 150}ms: ${lp?.linkAddresses}")
+                                println("DHCP IPv4 bereit nach ${i * 100}ms: ${lp?.linkAddresses}")
                                 break
                             }
-                            Thread.sleep(150)
+                            Thread.sleep(100)
                         }
                         if (!future.isDone) {
                             future.complete("Erfolgreich per Wi-Fi mit '$ssid' verbunden!")
@@ -844,7 +971,7 @@ object NativeWifiBridge {
             }
 
             return try {
-                future.get(30, TimeUnit.SECONDS)
+                future.get(25, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 "ERR: Wi-Fi Timeout: ${e.message}"
             }
@@ -881,14 +1008,13 @@ object NativeWifiBridge {
                 override fun onSuccess() {
                     println("WifiP2pManager.connect initiiert -> Warte auf DHCP-IP im Ziel-Subnetz...")
                     Thread {
-                        for (i in 1..45) {
+                        for (i in 1..100) {
                             if (future.isDone) break
-                            Thread.sleep(300)
-                            val localP2pIp = findLocalIpInSameSubnet("10.42.0.1")
-                                ?: findLocalIpInSameSubnet("192.168.49.1")
+                            Thread.sleep(100)
+                            val localP2pIp = findLocalIpInSameSubnet("192.168.49.1")
                             if (localP2pIp != null) {
                                 currentHotspotIp = localP2pIp.hostAddress ?: ""
-                                println("Wi-Fi Direct Client verbunden! Lokale P2P-IP: ${localP2pIp.hostAddress}")
+                                println("Wi-Fi Direct Client verbunden nach ${i * 100}ms! Lokale P2P-IP: ${localP2pIp.hostAddress}")
                                 future.complete("OK")
                                 break
                             }
@@ -921,9 +1047,17 @@ object NativeWifiBridge {
             val targetInet = Inet4Address.getByName(cleanIp)
 
             val localSubnetAddr = findLocalIpInSameSubnet(cleanIp)
-            val clientNet = activeWifiNetwork
+            val targetNet = activeWifiNetwork ?: findNetworkForInterfaceOrIp(cleanIp)
 
-            val socket: Socket = if (localSubnetAddr != null && clientNet == null) {
+            val socket: Socket = if (targetNet != null) {
+                targetNet.socketFactory.createSocket().also { s ->
+                    try {
+                        targetNet.bindSocket(s)
+                    } catch (e: Exception) {
+                        println("Hinweis bindSocket: ${e.message}")
+                    }
+                }
+            } else if (localSubnetAddr != null) {
                 Socket().also { rawSocket ->
                     try {
                         rawSocket.bind(InetSocketAddress(localSubnetAddr, 0))
@@ -931,22 +1065,12 @@ object NativeWifiBridge {
                         println("Warnung: Konnte Socket nicht an P2P-IP $localSubnetAddr binden: ${e.message}")
                     }
                 }
-            } else if (clientNet != null) {
-                clientNet.socketFactory.createSocket()
             } else {
-                Socket().also { rawSocket ->
-                    val fallbackBind = localSubnetAddr
-                        ?: currentHotspotIp.takeIf { it.isNotEmpty() }?.let { Inet4Address.getByName(it) }
-                    if (fallbackBind != null) {
-                        try {
-                            rawSocket.bind(InetSocketAddress(fallbackBind, 0))
-                        } catch (_: Exception) {}
-                    }
-                }
+                Socket()
             }
 
-            socket.soTimeout = 5000
-            socket.connect(InetSocketAddress(targetInet, port), 5000)
+            socket.soTimeout = 4000
+            socket.connect(InetSocketAddress(targetInet, port), 4000)
 
             val out = socket.getOutputStream()
             out.write(message.toByteArray(Charsets.UTF_8))
@@ -962,6 +1086,109 @@ object NativeWifiBridge {
         } catch (e: Throwable) {
             println("TCP Fehler Details: ${e.javaClass.simpleName}: ${e.message}")
             "ERR: ${e.javaClass.simpleName}: ${e.message}"
+        }
+    }
+
+    /**
+     * Öffnet und bindet einen TCP-Socket direkt an das Wi-Fi / P2P Netzwerk
+     * (bypasst VPNs via targetNet.bindSocket), verbindet sich und gibt den nativen
+     * OS File Descriptor (fd) an Rust zurück.
+     */
+    @JvmStatic
+    fun openConnectedWifiSocket(targetIp: String, port: Int, timeoutMs: Int): Int {
+        val cleanIp = targetIp.trim()
+        val targetInet = Inet4Address.getByName(cleanIp)
+        val localSubnetAddr = findLocalIpInSameSubnet(cleanIp)
+        val targetNet = activeWifiNetwork ?: findNetworkForInterfaceOrIp(cleanIp)
+
+        val socket: Socket = if (targetNet != null) {
+            targetNet.socketFactory.createSocket().also { s ->
+                try {
+                    targetNet.bindSocket(s)
+                } catch (e: Exception) {
+                    println("Hinweis bindSocket für Transfer: ${e.message}")
+                }
+            }
+        } else if (localSubnetAddr != null) {
+            Socket().also { rawSocket ->
+                try {
+                    rawSocket.bind(InetSocketAddress(localSubnetAddr, 0))
+                } catch (e: Exception) {
+                    println("Warnung: Konnte Transfer-Socket nicht an P2P-IP $localSubnetAddr binden: ${e.message}")
+                }
+            }
+        } else {
+            Socket()
+        }
+
+        socket.soTimeout = timeoutMs
+        socket.connect(InetSocketAddress(targetInet, port), timeoutMs)
+
+        val pfd = ParcelFileDescriptor.fromSocket(socket)
+            ?: throw IllegalStateException("ParcelFileDescriptor.fromSocket lieferte null")
+        val fd = pfd.detachFd()
+        try { socket.close() } catch (_: Exception) {}
+        return fd
+    }
+
+    /**
+     * Exportiert eine im privaten App-Ordner empfangene Datei über die MediaStore API
+     * direkt in den öffentlichen Android "Downloads"-Ordner (/storage/emulated/0/Download),
+     * damit sie sofort in der Dateien-App und Galerie sichtbar ist (ohne Storage-Permissions!).
+     */
+    @JvmStatic
+    fun exportFileToDownloads(sourcePath: String, fileName: String): String {
+        val ctx = appContext ?: return "ERR: Kein Context"
+        val srcFile = File(sourcePath)
+        if (!srcFile.exists()) {
+            return "ERR: Quelldatei existiert nicht: $sourcePath"
+        }
+
+        return try {
+            val ext = fileName.substringAfterLast('.', "").lowercase()
+            val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                ?: "application/octet-stream"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = ctx.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return "ERR: MediaStore Insert fehlgeschlagen"
+
+                resolver.openOutputStream(uri)?.use { outStream ->
+                    FileInputStream(srcFile).use { inStream ->
+                        inStream.copyTo(outStream, bufferSize = 256 * 1024)
+                    }
+                } ?: return "ERR: Konnte MediaStore OutputStream nicht öffnen"
+
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+
+                // Lösche die temporäre Kopie im unsichtbaren App-Sandbox-Verzeichnis
+                try { srcFile.delete() } catch (_: Exception) {}
+
+                val publicPath = "/storage/emulated/0/${Environment.DIRECTORY_DOWNLOADS}/$fileName"
+                println("Datei erfolgreich in öffentliche Downloads exportiert: $publicPath ($uri)")
+                publicPath
+            } else {
+                @Suppress("DEPRECATION")
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                val destFile = File(downloadsDir, fileName)
+                srcFile.copyTo(destFile, overwrite = true)
+                try { srcFile.delete() } catch (_: Exception) {}
+                destFile.absolutePath
+            }
+        } catch (e: Exception) {
+            println("Fehler beim Export in Downloads: ${e.message}")
+            "ERR: ${e.message}"
         }
     }
 }

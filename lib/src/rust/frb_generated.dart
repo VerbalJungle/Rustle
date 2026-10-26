@@ -16,6 +16,7 @@ import 'frb_generated.io.dart'
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 import 'platform.dart';
+import 'transfer/progress.dart';
 
 /// Main entrypoint of the Rust API
 class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
@@ -72,7 +73,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1149680770;
+  int get rustContentHash => -755213695;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -102,6 +103,8 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String> crateApiWifiBleStopBroadcast();
 
+  Future<String?> crateApiWifiCheckActiveVpn();
+
   String crateApiSimpleGreet({required String name});
 
   Future<void> crateApiSimpleInitApp();
@@ -110,7 +113,13 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String?> crateApiWifiPollReceivedPackets();
 
+  Future<TransferProgress?> crateApiWifiPollTransferProgress();
+
   Future<String> crateApiWifiSendTestPacket({required String payload});
+
+  Future<void> crateApiWifiSetDownloadDirectory({required String dirPath});
+
+  Future<String> crateApiWifiStartFileTransfer({required String filePath});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -276,13 +285,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "ble_stop_broadcast", argNames: []);
 
   @override
+  Future<String?> crateApiWifiCheckActiveVpn() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiCheckActiveVpnConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiCheckActiveVpnConstMeta =>
+      const TaskConstMeta(debugName: "check_active_vpn", argNames: []);
+
+  @override
   String crateApiSimpleGreet({required String name}) {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(name, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -307,7 +343,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 8,
             port: port_,
           );
         },
@@ -334,7 +370,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -361,7 +397,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 10,
             port: port_,
           );
         },
@@ -380,6 +416,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "poll_received_packets", argNames: []);
 
   @override
+  Future<TransferProgress?> crateApiWifiPollTransferProgress() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_box_autoadd_transfer_progress,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiPollTransferProgressConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiPollTransferProgressConstMeta =>
+      const TaskConstMeta(debugName: "poll_transfer_progress", argNames: []);
+
+  @override
   Future<String> crateApiWifiSendTestPacket({required String payload}) {
     return handler.executeNormal(
       NormalTask(
@@ -389,7 +452,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 12,
             port: port_,
           );
         },
@@ -407,6 +470,68 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiWifiSendTestPacketConstMeta =>
       const TaskConstMeta(debugName: "send_test_packet", argNames: ["payload"]);
 
+  @override
+  Future<void> crateApiWifiSetDownloadDirectory({required String dirPath}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(dirPath, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 13,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiSetDownloadDirectoryConstMeta,
+        argValues: [dirPath],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiSetDownloadDirectoryConstMeta =>
+      const TaskConstMeta(
+        debugName: "set_download_directory",
+        argNames: ["dirPath"],
+      );
+
+  @override
+  Future<String> crateApiWifiStartFileTransfer({required String filePath}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(filePath, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 14,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiWifiStartFileTransferConstMeta,
+        argValues: [filePath],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWifiStartFileTransferConstMeta =>
+      const TaskConstMeta(
+        debugName: "start_file_transfer",
+        argNames: ["filePath"],
+      );
+
   @protected
   String dco_decode_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -417,6 +542,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool dco_decode_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  TransferProgress dco_decode_box_autoadd_transfer_progress(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_transfer_progress(raw);
   }
 
   @protected
@@ -431,6 +562,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       isGo: dco_decode_bool(arr[2]),
       rssi: dco_decode_i_16(arr[3]),
     );
+  }
+
+  @protected
+  double dco_decode_f_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
   }
 
   @protected
@@ -455,6 +592,37 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
+  TransferProgress? dco_decode_opt_box_autoadd_transfer_progress(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_transfer_progress(raw);
+  }
+
+  @protected
+  TransferProgress dco_decode_transfer_progress(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
+    return TransferProgress(
+      fileId: dco_decode_String(arr[0]),
+      bytesTransferred: dco_decode_u_64(arr[1]),
+      totalBytes: dco_decode_u_64(arr[2]),
+      currentChunk: dco_decode_u_32(arr[3]),
+      totalChunks: dco_decode_u_32(arr[4]),
+      progressPercent: dco_decode_f_32(arr[5]),
+      speedBytesPerSec: dco_decode_u_64(arr[6]),
+      etaSeconds: dco_decode_u_64(arr[7]),
+      isFinished: dco_decode_bool(arr[8]),
+    );
+  }
+
+  @protected
+  int dco_decode_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
   }
 
   @protected
@@ -489,6 +657,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  TransferProgress sse_decode_box_autoadd_transfer_progress(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_transfer_progress(deserializer));
+  }
+
+  @protected
   DiscoveredPeer sse_decode_discovered_peer(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_address = sse_decode_String(deserializer);
@@ -501,6 +677,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       isGo: var_isGo,
       rssi: var_rssi,
     );
+  }
+
+  @protected
+  double sse_decode_f_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat32();
   }
 
   @protected
@@ -542,6 +724,50 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  TransferProgress? sse_decode_opt_box_autoadd_transfer_progress(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_transfer_progress(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  TransferProgress sse_decode_transfer_progress(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_fileId = sse_decode_String(deserializer);
+    var var_bytesTransferred = sse_decode_u_64(deserializer);
+    var var_totalBytes = sse_decode_u_64(deserializer);
+    var var_currentChunk = sse_decode_u_32(deserializer);
+    var var_totalChunks = sse_decode_u_32(deserializer);
+    var var_progressPercent = sse_decode_f_32(deserializer);
+    var var_speedBytesPerSec = sse_decode_u_64(deserializer);
+    var var_etaSeconds = sse_decode_u_64(deserializer);
+    var var_isFinished = sse_decode_bool(deserializer);
+    return TransferProgress(
+      fileId: var_fileId,
+      bytesTransferred: var_bytesTransferred,
+      totalBytes: var_totalBytes,
+      currentChunk: var_currentChunk,
+      totalChunks: var_totalChunks,
+      progressPercent: var_progressPercent,
+      speedBytesPerSec: var_speedBytesPerSec,
+      etaSeconds: var_etaSeconds,
+      isFinished: var_isFinished,
+    );
+  }
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint32();
+  }
+
+  @protected
   BigInt sse_decode_u_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getBigUint64();
@@ -577,6 +803,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_transfer_progress(
+    TransferProgress self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_transfer_progress(self, serializer);
+  }
+
+  @protected
   void sse_encode_discovered_peer(
     DiscoveredPeer self,
     SseSerializer serializer,
@@ -586,6 +821,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.name, serializer);
     sse_encode_bool(self.isGo, serializer);
     sse_encode_i_16(self.rssi, serializer);
+  }
+
+  @protected
+  void sse_encode_f_32(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat32(self);
   }
 
   @protected
@@ -624,6 +865,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (self != null) {
       sse_encode_String(self, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_transfer_progress(
+    TransferProgress? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_transfer_progress(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_transfer_progress(
+    TransferProgress self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.fileId, serializer);
+    sse_encode_u_64(self.bytesTransferred, serializer);
+    sse_encode_u_64(self.totalBytes, serializer);
+    sse_encode_u_32(self.currentChunk, serializer);
+    sse_encode_u_32(self.totalChunks, serializer);
+    sse_encode_f_32(self.progressPercent, serializer);
+    sse_encode_u_64(self.speedBytesPerSec, serializer);
+    sse_encode_u_64(self.etaSeconds, serializer);
+    sse_encode_bool(self.isFinished, serializer);
+  }
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint32(self);
   }
 
   @protected

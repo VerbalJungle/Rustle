@@ -10,7 +10,7 @@ class HandshakeManager {
   static final int myWeight = Random().nextInt(10000);
   static final String myDeviceId = "Peer_${Random().nextInt(999)}";
 
-  /// 1. Berechtigungen (nur auf Android nötig)
+  /// 1. Berechtigungen (Android)
   static Future<bool> requestPermissions() async {
     if (!Platform.isAndroid) return true;
 
@@ -25,7 +25,7 @@ class HandshakeManager {
     return statuses.values.every((s) => s.isGranted);
   }
 
-  /// 2. Vollautomatischer Handshake
+  /// 2. automatischer Handshake
   static Future<String> startAutoHandshake({
     required Function(String) onStatus,
   }) async {
@@ -59,7 +59,7 @@ class HandshakeManager {
 
     await FlutterBluePlus.stopScan();
 
-    // FALL A: Es wurde ein Partner gefunden -> Wir verbinden uns und verhandeln
+    // FALL A: Es wurde ein Partner gefunden -> verbinden und verhandeln
     if (targetDevice != null) {
       onStatus("Partner gefunden: ${targetDevice.platformName}. Verbinde via BLE...");
       await targetDevice.connect(timeout: const Duration(seconds: 5));
@@ -76,7 +76,7 @@ class HandshakeManager {
       onStatus("Partner-Priorität: $partnerWeight (Eigene: $myWeight)");
 
       if (myWeight > partnerWeight) {
-        // WIR haben gewonnen -> Wir starten den Hotspot
+        // Das aktuelle Gerät habt gewonnen -> Es startet den Hotspot
         onStatus("Ich werde Hotspot (GO). Starte Wi-Fi...");
         final hotspotInfo = await startHotspot(
           ssid: "Rustle_${Random().nextInt(999)}",
@@ -94,7 +94,7 @@ class HandshakeManager {
 
         return "Hotspot aktiv! Partner informiert.\n$hotspotInfo";
       } else {
-        // PARTNER hat gewonnen -> Wir warten auf seine Wi-Fi Daten
+        // PARTNER hat gewonnen -> Das aktuelle Gerät wartet auf seine Wi-Fi Daten
         onStatus("Partner wird Hotspot. Warte auf Wi-Fi Daten...");
 
         // Lesen der vom Partner hinterlegten Wi-Fi Daten
@@ -111,7 +111,7 @@ class HandshakeManager {
         return "Erfolgreich via Wi-Fi verbunden: $result";
       }
     }
-    // FALL B: Niemand gefunden -> Wir bieten uns selbst als Ziel an
+    // FALL B: Niemand gefunden -> Das aktuelle Gerät bietet uns selbst als Ziel an
     else {
       onStatus("Kein Partner gefunden. Übernehme Host-Rolle...");
       final hotspotInfo = await startHotspot(

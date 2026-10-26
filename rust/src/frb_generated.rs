@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1149680770;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -755213695;
 
 // Section: executor
 
@@ -216,6 +216,38 @@ fn wire__crate__api__wifi__ble_stop_broadcast_impl(
         },
     )
 }
+fn wire__crate__api__wifi__check_active_vpn_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "check_active_vpn",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::check_active_vpn()?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__simple__greet_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -344,6 +376,38 @@ fn wire__crate__api__wifi__poll_received_packets_impl(
         },
     )
 }
+fn wire__crate__api__wifi__poll_transfer_progress_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "poll_transfer_progress",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::poll_transfer_progress()?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__wifi__send_test_packet_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -371,6 +435,72 @@ fn wire__crate__api__wifi__send_test_packet_impl(
             move |context| {
                 transform_result_sse::<_, String>((move || {
                     let output_ok = crate::api::wifi::send_test_packet(api_payload)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__wifi__set_download_directory_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_download_directory",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_dir_path = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::set_download_directory(api_dir_path)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__wifi__start_file_transfer_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "start_file_transfer",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_file_path = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::start_file_transfer(api_file_path)?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -408,6 +538,13 @@ impl SseDecode for crate::platform::DiscoveredPeer {
             is_go: var_isGo,
             rssi: var_rssi,
         };
+    }
+}
+
+impl SseDecode for f32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_f32::<NativeEndian>().unwrap()
     }
 }
 
@@ -450,6 +587,52 @@ impl SseDecode for Option<String> {
         } else {
             return None;
         }
+    }
+}
+
+impl SseDecode for Option<crate::transfer::progress::TransferProgress> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::transfer::progress::TransferProgress>::sse_decode(
+                deserializer,
+            ));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for crate::transfer::progress::TransferProgress {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_fileId = <String>::sse_decode(deserializer);
+        let mut var_bytesTransferred = <u64>::sse_decode(deserializer);
+        let mut var_totalBytes = <u64>::sse_decode(deserializer);
+        let mut var_currentChunk = <u32>::sse_decode(deserializer);
+        let mut var_totalChunks = <u32>::sse_decode(deserializer);
+        let mut var_progressPercent = <f32>::sse_decode(deserializer);
+        let mut var_speedBytesPerSec = <u64>::sse_decode(deserializer);
+        let mut var_etaSeconds = <u64>::sse_decode(deserializer);
+        let mut var_isFinished = <bool>::sse_decode(deserializer);
+        return crate::transfer::progress::TransferProgress {
+            file_id: var_fileId,
+            bytes_transferred: var_bytesTransferred,
+            total_bytes: var_totalBytes,
+            current_chunk: var_currentChunk,
+            total_chunks: var_totalChunks,
+            progress_percent: var_progressPercent,
+            speed_bytes_per_sec: var_speedBytesPerSec,
+            eta_seconds: var_etaSeconds,
+            is_finished: var_isFinished,
+        };
+    }
+}
+
+impl SseDecode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u32::<NativeEndian>().unwrap()
     }
 }
 
@@ -498,10 +681,18 @@ fn pde_ffi_dispatcher_primary_impl(
         3 => wire__crate__api__wifi__ble_scan_impl(port, ptr, rust_vec_len, data_len),
         4 => wire__crate__api__wifi__ble_start_broadcast_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__wifi__ble_stop_broadcast_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__wifi__init_core_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__wifi__poll_received_packets_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__wifi__send_test_packet_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__wifi__check_active_vpn_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__wifi__init_core_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__wifi__poll_received_packets_impl(port, ptr, rust_vec_len, data_len),
+        11 => {
+            wire__crate__api__wifi__poll_transfer_progress_impl(port, ptr, rust_vec_len, data_len)
+        }
+        12 => wire__crate__api__wifi__send_test_packet_impl(port, ptr, rust_vec_len, data_len),
+        13 => {
+            wire__crate__api__wifi__set_download_directory_impl(port, ptr, rust_vec_len, data_len)
+        }
+        14 => wire__crate__api__wifi__start_file_transfer_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -514,7 +705,7 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        6 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -544,6 +735,34 @@ impl flutter_rust_bridge::IntoIntoDart<crate::platform::DiscoveredPeer>
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::transfer::progress::TransferProgress {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.file_id.into_into_dart().into_dart(),
+            self.bytes_transferred.into_into_dart().into_dart(),
+            self.total_bytes.into_into_dart().into_dart(),
+            self.current_chunk.into_into_dart().into_dart(),
+            self.total_chunks.into_into_dart().into_dart(),
+            self.progress_percent.into_into_dart().into_dart(),
+            self.speed_bytes_per_sec.into_into_dart().into_dart(),
+            self.eta_seconds.into_into_dart().into_dart(),
+            self.is_finished.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::transfer::progress::TransferProgress
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::transfer::progress::TransferProgress>
+    for crate::transfer::progress::TransferProgress
+{
+    fn into_into_dart(self) -> crate::transfer::progress::TransferProgress {
+        self
+    }
+}
 
 impl SseEncode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -566,6 +785,13 @@ impl SseEncode for crate::platform::DiscoveredPeer {
         <String>::sse_encode(self.name, serializer);
         <bool>::sse_encode(self.is_go, serializer);
         <i16>::sse_encode(self.rssi, serializer);
+    }
+}
+
+impl SseEncode for f32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_f32::<NativeEndian>(self).unwrap();
     }
 }
 
@@ -603,6 +829,38 @@ impl SseEncode for Option<String> {
         if let Some(value) = self {
             <String>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for Option<crate::transfer::progress::TransferProgress> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::transfer::progress::TransferProgress>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for crate::transfer::progress::TransferProgress {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.file_id, serializer);
+        <u64>::sse_encode(self.bytes_transferred, serializer);
+        <u64>::sse_encode(self.total_bytes, serializer);
+        <u32>::sse_encode(self.current_chunk, serializer);
+        <u32>::sse_encode(self.total_chunks, serializer);
+        <f32>::sse_encode(self.progress_percent, serializer);
+        <u64>::sse_encode(self.speed_bytes_per_sec, serializer);
+        <u64>::sse_encode(self.eta_seconds, serializer);
+        <bool>::sse_encode(self.is_finished, serializer);
+    }
+}
+
+impl SseEncode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u32::<NativeEndian>(self).unwrap();
     }
 }
 

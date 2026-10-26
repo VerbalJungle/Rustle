@@ -1,6 +1,7 @@
 use crate::platform::{
     BleDevice, DiscoveredPeer, PlatformBleManager, WifiDirectDevice, WifiDirectManager,
 };
+pub use crate::transfer::TransferProgress;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -17,8 +18,16 @@ static INCOMING_TCP_MSG: Mutex<Option<String>> = Mutex::new(None);
 static OUTGOING_TCP_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static TCP_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static IS_CURRENTLY_GO: Mutex<bool> = Mutex::new(false);
+// Speichert die bereits beim GO-Start vorbereiteten Hotspot-Zugangsdaten (Pre-Warming!)
+static ACTIVE_GO_CREDS: Mutex<Option<String>> = Mutex::new(None);
+
+// File Transfer Zustände
+static DOWNLOAD_DIRECTORY: Mutex<Option<String>> = Mutex::new(None);
+static ACTIVE_TRANSFER_PROGRESS: Mutex<Option<TransferProgress>> = Mutex::new(None);
+static TRANSFER_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 
 pub const RUSTLE_TCP_PORT: u16 = 4242;
+pub const RUSTLE_TRANSFER_PORT: u16 = 4243;
 
 pub fn init_core() -> Result<String, String> {
     let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -28,17 +37,43 @@ pub fn init_core() -> Result<String, String> {
     *ble = Some(PlatformBleManager::new());
 
     ensure_tcp_server_running();
+    ensure_transfer_server_running();
 
-    Ok("Rust Core (BLE + Wi-Fi Direct + TCP :4242) initialisiert".into())
+    Ok("Rust Core (BLE + Wi-Fi Direct + TCP :4242/:4243) initialisiert".into())
+}
+
+/// Prüft, ob ein aktives VPN auf dem Gerät läuft (Android oder Linux)
+pub fn check_active_vpn() -> Result<Option<String>, String> {
+    crate::platform::check_active_vpn_platform()
 }
 
 pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, String> {
     ensure_tcp_server_running();
+    ensure_transfer_server_running();
     *IS_CURRENTLY_GO.lock().unwrap() = is_go;
     if is_go {
         *PEER_IP.lock().unwrap() = None;
         OUTGOING_TCP_QUEUE.lock().unwrap().clear();
+
+        // PRE-WARMING: Starte den Wi-Fi Direct GO (Hotspot) direkt beim Aktivieren des GO-Modus
+        // und hinterlege Paket 3 (SSID;PSK;IP) sofort im GATT-Server!
+        let prewarmed_creds = {
+            let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
+            let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
+            w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?
+        };
+
+        if !prewarmed_creds.starts_with("ERR:") {
+            *ACTIVE_GO_CREDS.lock().unwrap() = Some(prewarmed_creds.clone());
+            let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
+            if let Some(ref mut mgr) = *ble {
+                let _ = mgr.set_hotspot_credentials(&prewarmed_creds);
+                let adv_msg = mgr.start_advertising(&device_name, is_go)?;
+                return Ok(format!("{}\nWi-Fi Direct GO bereit: {}", adv_msg, prewarmed_creds));
+            }
+        }
     }
+
     let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
     if let Some(ref mut mgr) = *ble {
         mgr.start_advertising(&device_name, is_go)
@@ -47,13 +82,36 @@ pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, S
     }
 }
 
+/// Beendet BLE Advertising/GATT sowie den Wi-Fi Direct Hotspot / Client-Connect
+/// und stellt (insbesondere unter Linux) das vorherige normale WLAN wieder her.
 pub fn ble_stop_broadcast() -> Result<String, String> {
-    let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut mgr) = *ble {
-        mgr.stop_advertising()
-    } else {
-        Err("BLE Manager nicht initialisiert".into())
+    *IS_CURRENTLY_GO.lock().unwrap() = false;
+    *PEER_IP.lock().unwrap() = None;
+    *ACTIVE_GO_CREDS.lock().unwrap() = None;
+    OUTGOING_TCP_QUEUE.lock().unwrap().clear();
+    if let Ok(mut p) = ACTIVE_TRANSFER_PROGRESS.lock() {
+        *p = None;
     }
+
+    let ble_msg = {
+        let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut mgr) = *ble {
+            mgr.stop_advertising().unwrap_or_else(|e| e)
+        } else {
+            "BLE inaktiv".into()
+        }
+    };
+
+    let wifi_msg = {
+        let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut w_mgr) = *wifi {
+            w_mgr.stop_hotspot().unwrap_or_else(|e| e)
+        } else {
+            "Wi-Fi inaktiv".into()
+        }
+    };
+
+    Ok(format!("Reset durchgeführt: {} | {}", ble_msg, wifi_msg))
 }
 
 pub fn ble_scan(duration_secs: u64) -> Result<Vec<DiscoveredPeer>, String> {
@@ -65,7 +123,7 @@ pub fn ble_scan(duration_secs: u64) -> Result<Vec<DiscoveredPeer>, String> {
     }
 }
 
-/// Auf dem GO: Prüft auf Paket 2 -> Startet Wi-Fi Direct GO (Autonomous Group) & TCP-Server -> Stellt Paket 3 (DIRECT-...;PSK;IP) bereit
+/// Auf dem GO: Prüft auf Paket 2 -> Stellt sicher, dass Paket 3 (DIRECT-...;PSK;IP) bereitsteht
 pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     let incoming = {
         let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -76,29 +134,29 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
     if let Some(req) = incoming {
         *IS_CURRENTLY_GO.lock().unwrap() = true;
         ensure_tcp_server_running();
+        ensure_transfer_server_running();
 
-        // WICHTIG: Die SSID MUSS mit "DIRECT-" beginnen (gemäß Wi-Fi Direct Spezifikation),
-        // damit Androids WifiP2pConfig.Builder().setNetworkName(...) sie akzeptiert und über
-        // das P2P-Interface (p2p-wlan0-x) verbindet, ohne das normale Heim-WLAN (wlan0) zu trennen!
-        let creds = {
-            let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
-            let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
-            w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?
+        let existing_creds = ACTIVE_GO_CREDS.lock().unwrap().clone();
+        let creds = match existing_creds {
+            Some(c) if !c.starts_with("ERR:") => c,
+            _ => {
+                let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
+                let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
+                let c = w_mgr.start_hotspot("DIRECT-RustleGO".into(), "password1234".into())?;
+                if c.starts_with("ERR:") {
+                    return Err(c);
+                }
+                *ACTIVE_GO_CREDS.lock().unwrap() = Some(c.clone());
+                let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
+                if let Some(ref mut mgr) = *ble {
+                    mgr.set_hotspot_credentials(&c)?
+                }
+                c
+            }
         };
 
-        if creds.starts_with("ERR:") {
-            return Err(creds);
-        }
-
-        {
-            let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
-            if let Some(ref mut mgr) = *ble {
-                mgr.set_hotspot_credentials(&creds)?;
-            }
-        }
-
         return Ok(Some(format!(
-            "Anfrage '{}' -> Wi-Fi Direct GO & TCP-Server (:4242) bereit! ({})",
+            "Anfrage '{}' -> Wi-Fi Direct GO & TCP-Server (:4242/:4243) bereit! ({})",
             req, creds
         )));
     }
@@ -141,6 +199,7 @@ pub fn ble_handshake_and_join_wifi(
     *PEER_IP.lock().unwrap() = Some(go_ip.clone());
 
     ensure_tcp_server_running();
+    ensure_transfer_server_running();
 
     let wifi_res = {
         let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -152,7 +211,7 @@ pub fn ble_handshake_and_join_wifi(
         return Err(wifi_res);
     }
 
-    // Hintergrund-Worker für INIT_PING und Rückkanal-Polling (umgeht Firewall/EACCES für GO -> Client)
+    // Hintergrund-Worker für INIT_PING und Rückkanal-Polling
     let target = go_ip.clone();
     std::thread::spawn(move || {
         let mut init_done = false;
@@ -180,7 +239,7 @@ pub fn ble_handshake_and_join_wifi(
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(800));
+            std::thread::sleep(std::time::Duration::from_millis(450));
         }
     });
 
@@ -218,7 +277,7 @@ pub fn send_test_packet(payload: String) -> Result<String, String> {
                 OUTGOING_TCP_QUEUE.lock().unwrap().push_back(payload.clone());
 
                 for _ in 0..25 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(80));
                     if OUTGOING_TCP_QUEUE.lock().unwrap().is_empty() {
                         return Ok(format!(
                             "Erfolg: Vom Client empfangen ({}) [via Rückkanal]",
@@ -240,6 +299,101 @@ pub fn send_test_packet(payload: String) -> Result<String, String> {
 pub fn poll_received_packets() -> Result<Option<String>, String> {
     let mut lock = INCOMING_TCP_MSG.lock().map_err(|e| e.to_string())?;
     Ok(lock.take())
+}
+
+// -------------------------------------------------------------
+// High-Speed Dateiübertragung (Chunking über TCP :4243)
+// -------------------------------------------------------------
+
+/// Setzt das Speicherverzeichnis für eingehende Dateien (z. B. Downloads)
+pub fn set_download_directory(dir_path: String) -> Result<(), String> {
+    let mut lock = DOWNLOAD_DIRECTORY.lock().map_err(|e| e.to_string())?;
+    *lock = Some(dir_path);
+    Ok(())
+}
+
+/// Fragt den aktuellen Fortschritt der aktiven Dateiübertragung ab
+pub fn poll_transfer_progress() -> Result<Option<TransferProgress>, String> {
+    let lock = ACTIVE_TRANSFER_PROGRESS.lock().map_err(|e| e.to_string())?;
+    Ok(lock.clone())
+}
+
+/// Startet das Streaming einer Datei an den verbundenen Peer im Hintergrund
+pub fn start_file_transfer(file_path: String) -> Result<String, String> {
+    let target_ip = {
+        let lock = PEER_IP.lock().unwrap();
+        match &*lock {
+            Some(ip) => ip.clone(),
+            None => return Err("ERR: Ziel-IP noch nicht bekannt! Bitte erst verbinden.".into()),
+        }
+    };
+
+    let p = std::path::Path::new(&file_path);
+    if !p.exists() {
+        return Err(format!("Datei '{}' existiert nicht!", file_path));
+    }
+
+    ensure_transfer_server_running();
+
+    let target = target_ip.clone();
+    let path_clone = file_path.clone();
+
+    std::thread::spawn(move || {
+        use std::time::Duration;
+
+        println!(
+            "[RUST TRANSFER] Verbinde zu {}:{} für Datei '{}' (VPN-Bypass aktiv)...",
+            target, RUSTLE_TRANSFER_PORT, path_clone
+        );
+
+        let mut stream = match crate::platform::create_connected_wifi_stream(
+            &target,
+            RUSTLE_TRANSFER_PORT,
+            Duration::from_secs(6),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                println!(
+                    "[RUST TRANSFER] Connect-Fehler zu {}:{}: {}",
+                    target, RUSTLE_TRANSFER_PORT, e
+                );
+                if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
+                    *lock = None;
+                }
+                return;
+            }
+        };
+
+        let file_id = format!(
+            "file_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+
+        let res = crate::transfer::FileSender::send_file(
+            &mut stream,
+            &path_clone,
+            file_id,
+            |progress| {
+                if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
+                    *lock = Some(progress.clone());
+                }
+            },
+        );
+
+        match res {
+            Ok(bytes) => {
+                println!("[RUST TRANSFER] Datei erfolgreich gesendet ({} Bytes)", bytes);
+            }
+            Err(err) => {
+                println!("[RUST TRANSFER] Fehler beim Senden: {}", err);
+            }
+        }
+    });
+
+    Ok(format!("Sende '{}' an {}:{}", file_path, target_ip, RUSTLE_TRANSFER_PORT))
 }
 
 fn ensure_tcp_server_running() {
@@ -328,6 +482,89 @@ fn ensure_tcp_server_running() {
                             let _ = s.write_all(reply.as_bytes());
                             let _ = s.flush();
                         }
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn ensure_transfer_server_running() {
+    let mut running = TRANSFER_SERVER_RUNNING.lock().unwrap();
+    if *running {
+        return;
+    }
+    *running = true;
+
+    thread::spawn(|| {
+        let listener = match TcpListener::bind(("0.0.0.0", RUSTLE_TRANSFER_PORT)) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("[RUST TRANSFER] Transfer Bind Fehler: {}", e);
+                if let Ok(mut flag) = TRANSFER_SERVER_RUNNING.lock() {
+                    *flag = false;
+                }
+                return;
+            }
+        };
+
+        println!(
+            "[RUST TRANSFER] File-Transfer-Server lauscht auf 0.0.0.0:{}",
+            RUSTLE_TRANSFER_PORT
+        );
+
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut s = stream;
+                let save_dir = {
+                    let lock = DOWNLOAD_DIRECTORY.lock().unwrap();
+                    lock.clone().unwrap_or_else(|| {
+                        std::env::temp_dir().to_string_lossy().to_string()
+                    })
+                };
+
+                println!(
+                    "[RUST TRANSFER] Eingehende Dateiübertragung! Zielverzeichnis: {}",
+                    save_dir
+                );
+
+                let res = crate::transfer::FileReceiver::receive_file(
+                    &mut s,
+                    &save_dir,
+                    |progress| {
+                        if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
+                            *lock = Some(progress.clone());
+                        }
+                    },
+                );
+
+                match res {
+                    Ok(path) => {
+                        let final_display_path =
+                            match crate::platform::export_file_to_downloads_platform(&path) {
+                                Ok(exported) => exported,
+                                Err(err) => {
+                                    println!(
+                                        "[RUST TRANSFER] Hinweis beim MediaStore-Export: {}",
+                                        err
+                                    );
+                                    path.display().to_string()
+                                }
+                            };
+
+                        println!(
+                            "[RUST TRANSFER] Datei erfolgreich gespeichert: {}",
+                            final_display_path
+                        );
+                        if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
+                            *inbox = Some(format!(
+                                "[Datei empfangen] {}",
+                                final_display_path
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        println!("[RUST TRANSFER] Empfangs-Fehler: {}", e);
                     }
                 }
             });

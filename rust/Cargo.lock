@@ -1349,6 +1349,9 @@ dependencies = [
  "futures-lite",
  "jni",
  "ndk-context",
+ "serde",
+ "serde_json",
+ "socket2",
  "tokio",
  "zbus",
 ]

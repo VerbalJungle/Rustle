@@ -5,12 +5,17 @@
 
 import '../frb_generated.dart';
 import '../platform.dart';
+import '../transfer/progress.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `ensure_tcp_server_running`
+// These functions are ignored because they are not marked as `pub`: `ensure_tcp_server_running`, `ensure_transfer_server_running`
 
 Future<String> initCore() => RustLib.instance.api.crateApiWifiInitCore();
+
+/// Prüft, ob ein aktives VPN auf dem Gerät läuft (Android oder Linux)
+Future<String?> checkActiveVpn() =>
+    RustLib.instance.api.crateApiWifiCheckActiveVpn();
 
 Future<String> bleStartBroadcast({
   required String deviceName,
@@ -20,13 +25,15 @@ Future<String> bleStartBroadcast({
   isGo: isGo,
 );
 
+/// Beendet BLE Advertising/GATT sowie den Wi-Fi Direct Hotspot / Client-Connect
+/// und stellt (insbesondere unter Linux) das vorherige normale WLAN wieder her.
 Future<String> bleStopBroadcast() =>
     RustLib.instance.api.crateApiWifiBleStopBroadcast();
 
 Future<List<DiscoveredPeer>> bleScan({required BigInt durationSecs}) =>
     RustLib.instance.api.crateApiWifiBleScan(durationSecs: durationSecs);
 
-/// Auf dem GO: Prüft auf Paket 2 -> Startet Wi-Fi Direct GO (Autonomous Group) & TCP-Server -> Stellt Paket 3 (DIRECT-...;PSK;IP) bereit
+/// Auf dem GO: Prüft auf Paket 2 -> Stellt sicher, dass Paket 3 (DIRECT-...;PSK;IP) bereitsteht
 Future<String?> blePollAndHandleGo() =>
     RustLib.instance.api.crateApiWifiBlePollAndHandleGo();
 
@@ -44,3 +51,15 @@ Future<String> sendTestPacket({required String payload}) =>
 
 Future<String?> pollReceivedPackets() =>
     RustLib.instance.api.crateApiWifiPollReceivedPackets();
+
+/// Setzt das Speicherverzeichnis für eingehende Dateien (z. B. Downloads)
+Future<void> setDownloadDirectory({required String dirPath}) =>
+    RustLib.instance.api.crateApiWifiSetDownloadDirectory(dirPath: dirPath);
+
+/// Fragt den aktuellen Fortschritt der aktiven Dateiübertragung ab
+Future<TransferProgress?> pollTransferProgress() =>
+    RustLib.instance.api.crateApiWifiPollTransferProgress();
+
+/// Startet das Streaming einer Datei an den verbundenen Peer im Hintergrund
+Future<String> startFileTransfer({required String filePath}) =>
+    RustLib.instance.api.crateApiWifiStartFileTransfer(filePath: filePath);
