@@ -10,6 +10,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.ScanResult as WifiScanResult
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.p2p.WifiP2pConfig
@@ -63,6 +64,9 @@ object NativeWifiBridge {
     @Volatile
     private var currentHotspotIp: String = ""
 
+    @Volatile
+    private var currentWifiChannelInfo: String = ""
+
     private val SERVICE_UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
     private val SYN_CHAR_UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
     private val ACK_CHAR_UUID = UUID.fromString("8260c653-1a54-426b-9e36-e84c238bc669")
@@ -100,6 +104,68 @@ object NativeWifiBridge {
         }
         val ch = p2pChannel ?: return null
         return Pair(mgr, ch)
+    }
+
+    /**
+     * Rechnet eine WLAN-Frequenz in MHz (z. B. 5180 oder 2437) in das Format "5 GHz • Ch 36" um.
+     */
+    private fun formatFrequencyToBandChannel(freqMhz: Int, channelWidthMhz: Int = 0): String {
+        if (freqMhz <= 0) return ""
+        val (band, ch) = when {
+            freqMhz == 2484 -> "2.4 GHz" to 14
+            freqMhz in 2412..2472 -> "2.4 GHz" to ((freqMhz - 2407) / 5)
+            freqMhz in 5170..5835 -> "5 GHz" to ((freqMhz - 5000) / 5)
+            freqMhz in 5955..7115 -> "6 GHz" to ((freqMhz - 5950) / 5)
+            else -> "${freqMhz} MHz" to 0
+        }
+        return if (ch > 0) "$band • Ch $ch" else band
+    }
+
+    /**
+     * Gibt das aktuell aktive Wi-Fi Direct / Hotspot Frequenzband und den Kanal zurück (z. B. "5 GHz • Ch 149").
+     */
+    @JvmStatic
+    fun getActiveWifiChannelInfo(): String {
+        if (currentWifiChannelInfo.isNotEmpty()) {
+            return currentWifiChannelInfo
+        }
+        val ctx = appContext ?: return ""
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = activeWifiNetwork
+            if (net != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val caps = cm.getNetworkCapabilities(net)
+                val wifiInfo = caps?.transportInfo as? WifiInfo
+                if (wifiInfo != null && wifiInfo.frequency > 0) {
+                    val width = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try {
+                            val wField = wifiInfo.javaClass.getMethod("getChannelWidth")
+                            when (wField.invoke(wifiInfo) as? Int) {
+                                1 -> 40
+                                2 -> 80
+                                3 -> 160
+                                4 -> 160
+                                5 -> 320
+                                else -> 0
+                            }
+                        } catch (_: Exception) { 0 }
+                    } else { 0 }
+                    val info = formatFrequencyToBandChannel(wifiInfo.frequency, width)
+                    if (info.isNotEmpty()) {
+                        currentWifiChannelInfo = info
+                        return info
+                    }
+                }
+            }
+            val wifiManager = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val connInfo = wifiManager.connectionInfo
+            if (connInfo != null && connInfo.frequency > 0) {
+                return formatFrequencyToBandChannel(connInfo.frequency)
+            }
+        } catch (_: Exception) {
+        }
+        return currentWifiChannelInfo
     }
 
     /**
@@ -361,6 +427,7 @@ object NativeWifiBridge {
             hotspotReservation = null
             currentHotspotIp = ""
             currentCredentials = ""
+            currentWifiChannelInfo = ""
 
             val p2pPair = ensureP2pInitialized(ctx)
             if (p2pPair != null) {
@@ -896,11 +963,11 @@ object NativeWifiBridge {
 
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
-                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
+                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture, prefer5Ghz = true)
                 }
 
                 override fun onFailure(reason: Int) {
-                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture)
+                    createP2pGroupInternal(mgr, ch, existingClientIps, p2pFuture, prefer5Ghz = true)
                 }
             })
 
@@ -937,6 +1004,17 @@ object NativeWifiBridge {
                         } else {
                             @Suppress("DEPRECATION")
                             reservation.wifiConfiguration?.preSharedKey ?: "rustle42"
+                        }
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            try {
+                                val sap = reservation.softApConfiguration
+                                val m = sap.javaClass.getMethod("getBand")
+                                val bandInt = m.invoke(sap) as? Int ?: 1
+                                currentWifiChannelInfo = if ((bandInt and 2) != 0) "5 GHz" else "2.4 GHz"
+                            } catch (_: Exception) {
+                                currentWifiChannelInfo = "Wi-Fi AP"
+                            }
                         }
 
                         Thread {
@@ -976,8 +1054,18 @@ object NativeWifiBridge {
         mgr: WifiP2pManager,
         ch: WifiP2pManager.Channel,
         existingClientIps: Set<String>,
-        future: CompletableFuture<String>
+        future: CompletableFuture<String>,
+        prefer5Ghz: Boolean = true
     ) {
+        val ctx = appContext
+        val wifiMgr = ctx?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val is5GhzSupported = try {
+            wifiMgr?.is5GHzBandSupported == true
+        } catch (_: Exception) {
+            true
+        }
+        val use5Ghz = prefer5Ghz && is5GhzSupported
+
         val createdListener = object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Thread {
@@ -989,10 +1077,20 @@ object NativeWifiBridge {
                                 val ssid = group.networkName.removeSurrounding("\"")
                                 val psk = group.passphrase
                                 val intfName = group.`interface`
+                                val freq = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    group.frequency
+                                } else {
+                                    0
+                                }
+                                if (freq > 0) {
+                                    currentWifiChannelInfo = formatFrequencyToBandChannel(freq)
+                                } else if (currentWifiChannelInfo.isEmpty()) {
+                                    currentWifiChannelInfo = if (use5Ghz) "5 GHz" else "2.4 GHz"
+                                }
                                 val ip = resolveHotspotIp(existingClientIps, intfName) ?: "192.168.49.1"
                                 currentHotspotIp = ip
                                 if (!future.isDone) {
-                                    println("Wi-Fi Direct GO bereit! SSID=$ssid, PSK=$psk, Interface=$intfName, IP=$ip (Heim-WLAN bleibt aktiv!)")
+                                    println("Wi-Fi Direct GO bereit! SSID=$ssid, PSK=$psk, Interface=$intfName, IP=$ip, Band=$currentWifiChannelInfo (Heim-WLAN bleibt aktiv!)")
                                     future.complete("$ssid;$psk;$ip")
                                 }
                             }
@@ -1005,17 +1103,27 @@ object NativeWifiBridge {
             }
 
             override fun onFailure(reason: Int) {
-                future.complete("ERR: createGroup fehlgeschlagen (Code $reason)")
+                if (use5Ghz && !future.isDone) {
+                    println("WifiP2pManager.createGroup auf 5 GHz fehlgeschlagen (Code $reason) -> Fallback auf 2.4 GHz...")
+                    createP2pGroupInternal(mgr, ch, existingClientIps, future, prefer5Ghz = false)
+                } else {
+                    future.complete("ERR: createGroup fehlgeschlagen (Code $reason)")
+                }
             }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
+                val band = if (use5Ghz) {
+                    WifiP2pConfig.GROUP_OWNER_BAND_5GHZ
+                } else {
+                    WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
+                }
                 val config = WifiP2pConfig.Builder()
                     .setNetworkName("DIRECT-AndGO")
                     .setPassphrase("rustle42")
                     .enablePersistentMode(false)
-                    .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+                    .setGroupOperatingBand(band)
                     .build()
                 mgr.createGroup(ch, config, createdListener)
                 return
@@ -1039,17 +1147,22 @@ object NativeWifiBridge {
         // Vor jedem neuen Verbindungsaufbau: Alten Hotspot/P2P-Status bereinigen
         stopWifiDirectAndHotspot()
 
-        // Sofortiger Blick in den vorhandenen Scan-Cache
+        // Sofortiger Blick in den vorhandenen Scan-Cache (bevorzuge 5 GHz BSSID falls vorhanden!)
         val matchedScan: WifiScanResult? = try {
             @Suppress("DEPRECATION")
             wifiManager.startScan()
-            wifiManager.scanResults?.firstOrNull {
+            val matches = wifiManager.scanResults?.filter {
                 @Suppress("DEPRECATION")
                 val rSsid = it.SSID?.removeSurrounding("\"") ?: ""
                 rSsid == ssid
-            }
+            }.orEmpty()
+            matches.maxByOrNull { it.frequency }
         } catch (_: Exception) {
             null
+        }
+
+        if (matchedScan != null && matchedScan.frequency > 0) {
+            currentWifiChannelInfo = formatFrequencyToBandChannel(matchedScan.frequency)
         }
 
         // WifiP2pManager.connect funktioniert nur mit einem echten Android Wi-Fi Direct GO (P2P Action Frames).
@@ -1110,6 +1223,26 @@ object NativeWifiBridge {
                     activeWifiNetwork = network
                     val bound = cm.bindProcessToNetwork(network)
                     println("onAvailable: Netzwerk=$network, bindProcess=$bound")
+                    try {
+                        val caps = cm.getNetworkCapabilities(network)
+                        val wifiInfo = caps?.transportInfo as? WifiInfo
+                        if (wifiInfo != null && wifiInfo.frequency > 0) {
+                            val width = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                try {
+                                    val wField = wifiInfo.javaClass.getMethod("getChannelWidth")
+                                    when (wField.invoke(wifiInfo) as? Int) {
+                                        1 -> 40
+                                        2 -> 80
+                                        3 -> 160
+                                        4 -> 160
+                                        5 -> 320
+                                        else -> 0
+                                    }
+                                } catch (_: Exception) { 0 }
+                            } else { 0 }
+                            currentWifiChannelInfo = formatFrequencyToBandChannel(wifiInfo.frequency, width)
+                        }
+                    } catch (_: Exception) {}
                     Thread {
                         for (i in 1..40) {
                             val lp = cm.getLinkProperties(network)
@@ -1124,6 +1257,28 @@ object NativeWifiBridge {
                             future.complete("Erfolgreich per Wi-Fi mit '$ssid' verbunden!")
                         }
                     }.start()
+                }
+
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    try {
+                        val wifiInfo = networkCapabilities.transportInfo as? WifiInfo
+                        if (wifiInfo != null && wifiInfo.frequency > 0) {
+                            val width = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                try {
+                                    val wField = wifiInfo.javaClass.getMethod("getChannelWidth")
+                                    when (wField.invoke(wifiInfo) as? Int) {
+                                        1 -> 40
+                                        2 -> 80
+                                        3 -> 160
+                                        4 -> 160
+                                        5 -> 320
+                                        else -> 0
+                                    }
+                                } catch (_: Exception) { 0 }
+                            } else { 0 }
+                            currentWifiChannelInfo = formatFrequencyToBandChannel(wifiInfo.frequency, width)
+                        }
+                    } catch (_: Exception) {}
                 }
 
                 override fun onLost(network: Network) {
@@ -1176,11 +1331,12 @@ object NativeWifiBridge {
             if (matchedScan != null && matchedScan.frequency > 0) {
                 builder.setGroupOperatingFrequency(matchedScan.frequency)
             } else {
-                builder.setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
+                // Kein Band erzwingen (GROUP_OWNER_BAND_AUTO), damit sowohl 5 GHz als auch 2.4 GHz GOs sofort gefunden werden!
+                builder.setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_AUTO)
             }
 
             val config = builder.build()
-            println("Starte WifiP2pManager.connect zu '$ssid' (Freq=${matchedScan?.frequency ?: "2.4GHz"})...")
+            println("Starte WifiP2pManager.connect zu '$ssid' (Freq=${matchedScan?.frequency ?: "AUTO (5GHz/2.4GHz)"})...")
 
             mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
@@ -1192,6 +1348,11 @@ object NativeWifiBridge {
                             val localP2pIp = findLocalIpInSameSubnet("192.168.49.1")
                             if (localP2pIp != null) {
                                 currentHotspotIp = localP2pIp.hostAddress ?: ""
+                                mgr.requestGroupInfo(ch) { group ->
+                                    if (group != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && group.frequency > 0) {
+                                        currentWifiChannelInfo = formatFrequencyToBandChannel(group.frequency)
+                                    }
+                                }
                                 println("Wi-Fi Direct Client verbunden nach ${i * 100}ms! Lokale P2P-IP: ${localP2pIp.hostAddress}")
                                 future.complete("OK")
                                 break
@@ -1299,6 +1460,9 @@ object NativeWifiBridge {
             Socket()
         }
 
+        socket.tcpNoDelay = true
+        socket.sendBufferSize = 2 * 1024 * 1024
+        socket.receiveBufferSize = 2 * 1024 * 1024
         socket.soTimeout = timeoutMs
         socket.connect(InetSocketAddress(targetInet, port), timeoutMs)
 

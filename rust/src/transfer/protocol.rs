@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 pub const MAGIC_BYTE: u8 = 0x52; // 'R' für Rustle
-pub const DEFAULT_CHUNK_SIZE: u32 = 256 * 1024; // 256 KB
+pub const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024; // 1 MB für maximale Wi-Fi Durchsatzrate
 pub const HEADER_SIZE: usize = 12;
 
 #[repr(u8)]
@@ -123,7 +123,8 @@ pub struct TransferResponse {
     pub message: Option<String>,
 }
 
-/// Schreibt einen kompletten Frame (12-Byte-Header + Rohdaten) in den Writer
+/// Schreibt einen kompletten Frame (12-Byte-Header + Rohdaten) in den Writer OHNE künstlichen Flush,
+/// damit der TCP-Stack kontinuierlich streamen kann.
 pub fn write_frame<W: Write>(
     writer: &mut W,
     header: &FrameHeader,
@@ -135,6 +136,16 @@ pub fn write_frame<W: Write>(
     if !payload.is_empty() {
         writer.write_all(payload)?;
     }
+    Ok(())
+}
+
+/// Schreibt einen Frame und erzwingt das Leeren (z. B. für Handshake und Metadaten-Frames)
+pub fn write_frame_and_flush<W: Write>(
+    writer: &mut W,
+    header: &FrameHeader,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    write_frame(writer, header, payload)?;
     writer.flush()?;
     Ok(())
 }

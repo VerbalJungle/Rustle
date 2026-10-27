@@ -72,9 +72,10 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   String _status = 'Noch nicht initialisiert';
   String? _goEventBanner;
   String? _activeVpn;
+  String? _wifiChannelInfo;
   List<DiscoveredPeer> _peers = [];
   bool _busy = false;
-  Timer? _pollTimer;
+  StreamSubscription<RustEvent>? _eventSub;
   TransferProgress? _activeProgress;
   late final AppLifecycleListener _lifecycleListener;
 
@@ -83,14 +84,14 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     super.initState();
     _lifecycleListener = AppLifecycleListener(
       onExitRequested: () async {
-        _pollTimer?.cancel();
+        await _eventSub?.cancel();
         try {
           await bleStopBroadcast();
         } catch (_) {}
         return AppExitResponse.exit;
       },
       onDetach: () {
-        _pollTimer?.cancel();
+        _eventSub?.cancel();
         bleStopBroadcast();
       },
     );
@@ -99,7 +100,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    _eventSub?.cancel();
     _lifecycleListener.dispose();
     bleStopBroadcast();
     super.dispose();
@@ -110,9 +111,63 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       final res = await initCore();
       setState(() => _status = res);
       await _initDownloadDir();
+      _listenToRustEvents();
       await _checkVpn();
+      await _refreshWifiChannelInfo();
     } catch (e) {
       setState(() => _status = 'Init-Fehler: $e');
+    }
+  }
+
+  void _listenToRustEvents() {
+    _eventSub?.cancel();
+    _eventSub = subscribeEvents().listen(
+      (event) {
+        if (!mounted) return;
+        bool shouldRefreshChannel = false;
+        setState(() {
+          if (event.vpnUpdated) {
+            _activeVpn = event.activeVpn;
+          }
+          if (event.wifiChannelUpdated) {
+            _wifiChannelInfo = event.wifiChannelInfo;
+          }
+          if (event.goHandshake != null && _goEventBanner == null) {
+            _goEventBanner = event.goHandshake;
+            _status = 'GO: Hotspot & TCP-Server (:4242/:4243) laufen!';
+            shouldRefreshChannel = true;
+          }
+          if (event.tcpMessage != null) {
+            _goEventBanner = 'NACHRICHT EMPFANGEN:\n${event.tcpMessage}';
+            _status = 'Letztes Paket erfolgreich verarbeitet!';
+          }
+          if (event.transferProgress != null) {
+            if (_wifiChannelInfo == null) {
+              shouldRefreshChannel = true;
+            }
+            _activeProgress = event.transferProgress;
+          }
+        });
+        if (shouldRefreshChannel) {
+          _refreshWifiChannelInfo();
+        }
+      },
+      onError: (e) {
+        if (mounted) {
+          setState(() => _status = 'Stream-Fehler: $e');
+        }
+      },
+    );
+  }
+
+  Future<void> _refreshWifiChannelInfo() async {
+    try {
+      final info = await getActiveWifiChannelInfo();
+      if (mounted && info != _wifiChannelInfo) {
+        setState(() => _wifiChannelInfo = info);
+      }
+    } catch (e) {
+      debugPrint('Wi-Fi channel check error: $e');
     }
   }
 
@@ -142,46 +197,6 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     }
   }
 
-  void _startPolling({required bool isGo}) {
-    _pollTimer?.cancel();
-    int tick = 0;
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 250), (_) async {
-      tick++;
-      try {
-        // Alle ~2 Sekunden VPN-Status prüfen
-        if (tick % 8 == 0) {
-          _checkVpn();
-        }
-
-        // Nur solange polln, bis der GO den Handshake empfangen hat
-        if (isGo && _goEventBanner == null) {
-          final event = await blePollAndHandleGo();
-          if (event != null && mounted) {
-            setState(() {
-              _goEventBanner = event;
-              _status = 'GO: Hotspot & TCP-Server (:4242/:4243) laufen!';
-            });
-          }
-        }
-        final tcpMsg = await pollReceivedPackets();
-        if (tcpMsg != null && mounted) {
-          setState(() {
-            _goEventBanner = 'NACHRICHT EMPFANGEN:\n$tcpMsg';
-            _status = 'Letztes Paket erfolgreich verarbeitet!';
-          });
-        }
-        final progress = await pollTransferProgress();
-        if (progress != null && mounted) {
-          setState(() {
-            _activeProgress = progress;
-          });
-        }
-      } catch (e) {
-        if (mounted) setState(() => _status = 'Poll-Fehler: $e');
-      }
-    });
-  }
-
   Future<void> _advertise(bool isGo) async {
     setState(() {
       _busy = true;
@@ -195,10 +210,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         isGo: isGo,
       );
       setState(() => _status = res);
-
-      if (isGo) {
-        _startPolling(isGo: true);
-      }
+      await _refreshWifiChannelInfo();
     } catch (e) {
       setState(() => _status = 'Broadcast-Fehler: $e');
     } finally {
@@ -207,11 +219,11 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
   }
 
   Future<void> _resetConnection() async {
-    _pollTimer?.cancel();
     setState(() {
       _busy = true;
       _goEventBanner = null;
       _activeProgress = null;
+      _wifiChannelInfo = null;
       _status = 'Setze Hotspot & BLE zurück (stelle Normal-WLAN wieder her)...';
     });
     try {
@@ -221,6 +233,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         _status = res;
       });
       await _checkVpn();
+      await _refreshWifiChannelInfo();
     } catch (e) {
       setState(() => _status = 'Reset-Fehler: $e');
     } finally {
@@ -259,7 +272,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         clientName: 'PeerClient',
       );
       setState(() => _status = 'ERFOLG!\n$res');
-      _startPolling(isGo: false);
+      await _refreshWifiChannelInfo();
     } catch (e) {
       setState(() => _status = 'Handshake-Fehler:\n$e');
     } finally {
@@ -279,6 +292,8 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       _activeProgress = null;
       _status = 'Starte Transfer von "${result.files.single.name}" (:4243)...';
     });
+
+    await _refreshWifiChannelInfo();
 
     try {
       final res = await startFileTransfer(filePath: filePath);
@@ -314,13 +329,13 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // VPN-Warnhinweis oben am Bildschirm (abgestimmt auf Dark Mode)
+            // VPN-Warnhinweis oben am Bildschirm
             if (_activeVpn != null)
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                 margin: const EdgeInsets.only(bottom: 12),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF451A03), // Tiefes Amber
+                  color: const Color(0xFF451A03),
                   border: Border.all(color: const Color(0xFFB45309), width: 1.2),
                   borderRadius: BorderRadius.circular(10),
                 ),
@@ -382,7 +397,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                 const SizedBox(width: 8),
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF7F1D1D), // Dark Red
+                    backgroundColor: const Color(0xFF7F1D1D),
                     foregroundColor: const Color(0xFFFCA5A5),
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                   ),
@@ -501,9 +516,46 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                             '${(_activeProgress!.bytesTransferred.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB / ${(_activeProgress!.totalBytes.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB',
                             style: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
                           ),
-                          Text(
-                            '${(_activeProgress!.speedBytesPerSec.toDouble() / (1024 * 1024)).toStringAsFixed(1)} MB/s',
-                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF818CF8)),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                '${(_activeProgress!.speedBytesPerSec.toDouble() / (1024 * 1024)).toStringAsFixed(1)} MB/s',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF818CF8),
+                                ),
+                              ),
+                              if (_wifiChannelInfo != null && _wifiChannelInfo!.isNotEmpty) ...[
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: _wifiChannelInfo!.startsWith('5')
+                                        ? const Color(0xFF064E3B)
+                                        : const Color(0xFF1E293B),
+                                    borderRadius: BorderRadius.circular(5),
+                                    border: Border.all(
+                                      color: _wifiChannelInfo!.startsWith('5')
+                                          ? const Color(0xFF10B981)
+                                          : const Color(0xFF475569),
+                                      width: 0.8,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    _wifiChannelInfo!,
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: _wifiChannelInfo!.startsWith('5')
+                                          ? const Color(0xFF6EE7B7)
+                                          : const Color(0xFFCBD5E1),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                           Text(
                             'Chunk: ${_activeProgress!.currentChunk}/${_activeProgress!.totalChunks}',

@@ -1,10 +1,10 @@
 use super::progress::{ProgressTracker, TransferProgress};
 use super::protocol::{
-    read_exact_payload, read_frame_header, write_frame, FileMetadata, FrameHeader, MsgType,
-    TransferResponse,
+    read_exact_payload, read_frame_header, write_frame_and_flush, FileMetadata, FrameHeader,
+    MsgType, TransferResponse,
 };
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub struct FileReceiver;
@@ -77,7 +77,7 @@ impl FileReceiver {
                 .map_err(|e| format!("Fehler beim Seek in Part-Datei: {}", e))?;
         }
 
-        // 3. Antwort an Sender schicken (Zusage & ggf. Start-Chunk)
+        // 3. Antwort an Sender schicken (Zusage & ggf. Start-Chunk) und direkt flushen
         let response = TransferResponse {
             file_id: metadata.file_id.clone(),
             accepted: true,
@@ -89,10 +89,10 @@ impl FileReceiver {
             .map_err(|e| format!("Fehler beim Serialisieren der TransferResponse: {}", e))?;
 
         let resp_header = FrameHeader::new(MsgType::Control, 0, resp_json.len() as u32);
-        write_frame(stream, &resp_header, &resp_json)
+        write_frame_and_flush(stream, &resp_header, &resp_json)
             .map_err(|e| format!("Fehler beim Senden der TransferResponse: {}", e))?;
 
-        // 4. Chunks empfangen
+        // 4. Chunks empfangen mit 2 MB gepuffertem File-Writer und großem Socket-Reader
         let mut tracker = ProgressTracker::new(
             metadata.file_id.clone(),
             metadata.file_size,
@@ -106,9 +106,11 @@ impl FileReceiver {
         }
 
         let mut expected_chunk = start_chunk;
+        let mut buffered_stream = BufReader::with_capacity(2 * 1024 * 1024, stream);
+        let mut buffered_file = BufWriter::with_capacity(2 * 1024 * 1024, file);
 
         while expected_chunk < metadata.total_chunks {
-            let chunk_header = read_frame_header(stream)
+            let chunk_header = read_frame_header(&mut buffered_stream)
                 .map_err(|e| format!("Fehler beim Lesen von Chunk-Header {}: {}", expected_chunk, e))?;
 
             if chunk_header.msg_type != MsgType::DataChunk {
@@ -118,10 +120,11 @@ impl FileReceiver {
                 ));
             }
 
-            let payload = read_exact_payload(stream, chunk_header.payload_len as usize)
+            let payload = read_exact_payload(&mut buffered_stream, chunk_header.payload_len as usize)
                 .map_err(|e| format!("Fehler beim Lesen von Chunk-Payload {}: {}", expected_chunk, e))?;
 
-            file.write_all(&payload)
+            buffered_file
+                .write_all(&payload)
                 .map_err(|e| format!("Fehler beim Schreiben von Chunk {}: {}", expected_chunk, e))?;
 
             if let Some(progress) = tracker.update(expected_chunk, payload.len()) {
@@ -131,9 +134,10 @@ impl FileReceiver {
             expected_chunk += 1;
         }
 
-        file.flush()
+        buffered_file
+            .flush()
             .map_err(|e| format!("Fehler beim Flushen der Datei: {}", e))?;
-        drop(file);
+        drop(buffered_file);
 
         // 5. Part-Datei in finalen Namen umbenennen
         if final_path.exists() {
@@ -142,9 +146,10 @@ impl FileReceiver {
         fs::rename(&part_path, &final_path)
             .map_err(|e| format!("Konnte Part-Datei nicht final umbenennen: {}", e))?;
 
-        // 6. TransferAck an Sender schicken
+        // 6. TransferAck an Sender schicken (über den darunterliegenden Stream)
+        let underlying_stream = buffered_stream.into_inner();
         let ack_header = FrameHeader::new(MsgType::TransferAck, 0, 0);
-        write_frame(stream, &ack_header, &[])
+        write_frame_and_flush(underlying_stream, &ack_header, &[])
             .map_err(|e| format!("Fehler beim Senden des finalen TransferAck: {}", e))?;
 
         Ok(final_path)

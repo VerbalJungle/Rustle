@@ -48,6 +48,15 @@ pub fn check_active_vpn_platform() -> Result<Option<String>, String> {
     }
 }
 
+pub fn get_active_wifi_channel_info_platform() -> Result<Option<String>, String> {
+    let res = call_kotlin_bridge("getActiveWifiChannelInfo", "()Ljava/lang/String;", &[])?;
+    if res.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(res))
+    }
+}
+
 pub fn create_connected_wifi_stream(
     target_ip: &str,
     port: u16,

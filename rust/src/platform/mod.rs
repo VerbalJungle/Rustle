@@ -3,7 +3,8 @@ mod android;
 #[cfg(target_os = "android")]
 pub use android::{
     check_active_vpn_platform, create_connected_wifi_stream, export_file_to_downloads_platform,
-    send_tcp_packet_platform, AndroidBleManager as PlatformBleManager, WifiDirectManager,
+    get_active_wifi_channel_info_platform, send_tcp_packet_platform,
+    AndroidBleManager as PlatformBleManager, WifiDirectManager,
 };
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
@@ -11,7 +12,8 @@ mod linux;
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub use linux::{
     check_active_vpn_platform, create_connected_wifi_stream, export_file_to_downloads_platform,
-    send_tcp_packet_platform, LinuxBleManager as PlatformBleManager, WifiDirectManager,
+    get_active_wifi_channel_info_platform, send_tcp_packet_platform,
+    LinuxBleManager as PlatformBleManager, WifiDirectManager,
 };
 
 pub const RUSTLE_SERVICE_UUID: u128 = 0x4fafc201_1fb5_459e_8fcc_c5c9c331914b;

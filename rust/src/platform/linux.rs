@@ -354,13 +354,22 @@ async fn start_hotspot_internal(
 
     // 3. Erzeuge das Wi-Fi Direct GO / Hotspot-Profil mit reinem WPA2-PSK (pmf=1 disable)
     //    und connection.zone=trusted (damit firewalld auf Linux Port 4242 nicht blockiert!).
+    //    Versuche zuerst 5 GHz (Band "a", Kanal 36) für maximale Geschwindigkeit, mit Fallback auf 2.4 GHz ("bg").
     if let Some(ref ifname) = wifi_ifname {
-        println!(
-            "[LINUX WIFI] Erstelle Wi-Fi Direct GO ('{}') auf Interface '{}' via nmcli...",
-            ssid, ifname
-        );
-        let add_res = std::process::Command::new("nmcli")
-            .args([
+        for (band, channel_opt, label) in [
+            ("a", Some("36"), "5 GHz (Kanal 36)"),
+            ("bg", None, "2.4 GHz (Fallback)"),
+        ] {
+            let _ = std::process::Command::new("nmcli")
+                .args(["connection", "delete", "Rust_Hotspot"])
+                .output();
+
+            println!(
+                "[LINUX WIFI] Erstelle Wi-Fi Direct GO ('{}') auf Interface '{}' via nmcli ({})...",
+                ssid, ifname, label
+            );
+
+            let mut args = vec![
                 "connection",
                 "add",
                 "type",
@@ -378,7 +387,13 @@ async fn start_hotspot_internal(
                 "802-11-wireless.mode",
                 "ap",
                 "802-11-wireless.band",
-                "bg",
+                band,
+            ];
+            if let Some(ch) = channel_opt {
+                args.push("802-11-wireless.channel");
+                args.push(ch);
+            }
+            args.extend_from_slice(&[
                 "ipv4.method",
                 "shared",
                 "wifi-sec.key-mgmt",
@@ -395,32 +410,36 @@ async fn start_hotspot_internal(
                 "1", // 1 = disable PMF (reines WPA2-PSK für WifiP2pManager!)
                 "wifi-sec.wps-method",
                 "1", // 1 = disabled
-            ])
-            .output();
+            ]);
 
-        if let Ok(output) = add_res {
-            if output.status.success() {
-                let up_res = std::process::Command::new("nmcli")
-                    .args(["connection", "up", "Rust_Hotspot"])
-                    .output();
-                if let Ok(up_out) = up_res {
-                    if up_out.status.success() {
-                        *HOTSPOT_ACTIVE.lock().unwrap() = true;
-                        let ip = resolve_local_linux_hotspot_ip()
-                            .unwrap_or_else(|| "10.42.0.1".to_string());
-                        return Ok(ip);
-                    } else {
-                        println!(
-                            "[LINUX WIFI] nmcli up Warnung: {}",
-                            String::from_utf8_lossy(&up_out.stderr)
-                        );
+            let add_res = std::process::Command::new("nmcli").args(&args).output();
+
+            if let Ok(output) = add_res {
+                if output.status.success() {
+                    let up_res = std::process::Command::new("nmcli")
+                        .args(["connection", "up", "Rust_Hotspot"])
+                        .output();
+                    if let Ok(up_out) = up_res {
+                        if up_out.status.success() {
+                            *HOTSPOT_ACTIVE.lock().unwrap() = true;
+                            let ip = resolve_local_linux_hotspot_ip()
+                                .unwrap_or_else(|| "10.42.0.1".to_string());
+                            return Ok(ip);
+                        } else {
+                            println!(
+                                "[LINUX WIFI] nmcli up ({}) Hinweis: {}",
+                                label,
+                                String::from_utf8_lossy(&up_out.stderr)
+                            );
+                        }
                     }
+                } else {
+                    println!(
+                        "[LINUX WIFI] nmcli add ({}) Warnung: {}",
+                        label,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
-            } else {
-                println!(
-                    "[LINUX WIFI] nmcli add Warnung: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
             }
         }
     }
@@ -1171,6 +1190,65 @@ pub fn check_active_vpn_linux() -> Option<String> {
     None
 }
 
+/// Ermittelt auf Linux das aktuell aktive Frequenzband und den Kanal der WLAN-Verbindung / des Hotspots (z. B. "5 GHz • Ch 36").
+pub fn get_active_wifi_channel_info_platform() -> Result<Option<String>, String> {
+    // 1. Primär über `iw dev`: Liefert exakten Kanal und Frequenz (z. B. "channel 36 (5180 MHz)")
+    if let Ok(out) = std::process::Command::new("iw").args(["dev"]).output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("channel ") {
+                let ch_str = rest.split_whitespace().next().unwrap_or("");
+                if let Ok(ch) = ch_str.parse::<u32>() {
+                    let mut freq_mhz: u32 = 0;
+                    if let Some(open_paren) = rest.find('(') {
+                        let after = &rest[open_paren + 1..];
+                        let freq_token = after.split_whitespace().next().unwrap_or("");
+                        freq_mhz = freq_token.parse::<u32>().unwrap_or(0);
+                    }
+                    let mut width_str = String::new();
+                    if let Some(w_pos) = rest.find("width:") {
+                        let after_w = rest[w_pos + 6..].trim();
+                        let w_parts: Vec<&str> = after_w.split(',').next().unwrap_or("").split_whitespace().collect();
+                        if !w_parts.is_empty() {
+                            width_str = format!(" ({} MHz)", w_parts[0]);
+                        }
+                    }
+                    let band = if freq_mhz >= 5900 {
+                        "6 GHz"
+                    } else if freq_mhz >= 5000 || ch >= 32 {
+                        "5 GHz"
+                    } else {
+                        "2.4 GHz"
+                    };
+                    return Ok(Some(format!("{} • Ch {}{}", band, ch, width_str)));
+                }
+            }
+        }
+    }
+
+    // 2. Fallback über `nmcli`: Suche das in Benutzung befindliche (*) AP/Client-Netzwerk
+    if let Ok(out) = std::process::Command::new("nmcli")
+        .args(["-t", "-f", "IN-USE,CHAN,FREQ", "dev", "wifi"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("*:") {
+                let parts: Vec<&str> = rest.split(':').collect();
+                if !parts.is_empty() {
+                    if let Ok(ch) = parts[0].trim().parse::<u32>() {
+                        let band = if ch >= 32 { "5 GHz" } else { "2.4 GHz" };
+                        return Ok(Some(format!("{} • Ch {}", band, ch)));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Findet die lokale IPv4-Adresse des Linux-Rechners, die im selben /24-Subnetz wie `target_ip` liegt.
 fn find_local_ipv4_in_same_subnet(target_ip: &str) -> Option<Ipv4Addr> {
     let parts: Vec<&str> = target_ip.trim().split('.').collect();
@@ -1235,7 +1313,12 @@ pub fn create_connected_wifi_stream(
         .connect_timeout(&sock_addr.into(), timeout)
         .map_err(|e| format!("Linux TCP-Connect zu {} fehlgeschlagen: {}", sock_addr, e))?;
 
+    let _ = socket.set_tcp_nodelay(true);
+    let _ = socket.set_send_buffer_size(2 * 1024 * 1024);
+    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024);
+
     let stream: std::net::TcpStream = socket.into();
+    let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)

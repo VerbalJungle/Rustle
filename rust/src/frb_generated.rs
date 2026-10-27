@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -755213695;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1223815305;
 
 // Section: executor
 
@@ -242,6 +242,38 @@ fn wire__crate__api__wifi__check_active_vpn_impl(
             move |context| {
                 transform_result_sse::<_, String>((move || {
                     let output_ok = crate::api::wifi::check_active_vpn()?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__wifi__get_active_wifi_channel_info_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "get_active_wifi_channel_info",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::get_active_wifi_channel_info()?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -507,8 +539,62 @@ fn wire__crate__api__wifi__start_file_transfer_impl(
         },
     )
 }
+fn wire__crate__api__wifi__subscribe_events_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "subscribe_events",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_sink = <StreamSink<
+                crate::api::wifi::RustEvent,
+                flutter_rust_bridge::for_generated::SseCodec,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::wifi::subscribe_events(api_sink)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 
 // Section: dart2rust
+
+impl SseDecode for flutter_rust_bridge::for_generated::anyhow::Error {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <String>::sse_decode(deserializer);
+        return flutter_rust_bridge::for_generated::anyhow::anyhow!("{}", inner);
+    }
+}
+
+impl SseDecode
+    for StreamSink<crate::api::wifi::RustEvent, flutter_rust_bridge::for_generated::SseCodec>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <String>::sse_decode(deserializer);
+        return StreamSink::deserialize(inner);
+    }
+}
 
 impl SseDecode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -603,6 +689,29 @@ impl SseDecode for Option<crate::transfer::progress::TransferProgress> {
     }
 }
 
+impl SseDecode for crate::api::wifi::RustEvent {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_goHandshake = <Option<String>>::sse_decode(deserializer);
+        let mut var_tcpMessage = <Option<String>>::sse_decode(deserializer);
+        let mut var_transferProgress =
+            <Option<crate::transfer::progress::TransferProgress>>::sse_decode(deserializer);
+        let mut var_vpnUpdated = <bool>::sse_decode(deserializer);
+        let mut var_activeVpn = <Option<String>>::sse_decode(deserializer);
+        let mut var_wifiChannelUpdated = <bool>::sse_decode(deserializer);
+        let mut var_wifiChannelInfo = <Option<String>>::sse_decode(deserializer);
+        return crate::api::wifi::RustEvent {
+            go_handshake: var_goHandshake,
+            tcp_message: var_tcpMessage,
+            transfer_progress: var_transferProgress,
+            vpn_updated: var_vpnUpdated,
+            active_vpn: var_activeVpn,
+            wifi_channel_updated: var_wifiChannelUpdated,
+            wifi_channel_info: var_wifiChannelInfo,
+        };
+    }
+}
+
 impl SseDecode for crate::transfer::progress::TransferProgress {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -682,17 +791,24 @@ fn pde_ffi_dispatcher_primary_impl(
         4 => wire__crate__api__wifi__ble_start_broadcast_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__wifi__ble_stop_broadcast_impl(port, ptr, rust_vec_len, data_len),
         6 => wire__crate__api__wifi__check_active_vpn_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__wifi__init_core_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__wifi__poll_received_packets_impl(port, ptr, rust_vec_len, data_len),
-        11 => {
+        7 => wire__crate__api__wifi__get_active_wifi_channel_info_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        9 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__wifi__init_core_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__wifi__poll_received_packets_impl(port, ptr, rust_vec_len, data_len),
+        12 => {
             wire__crate__api__wifi__poll_transfer_progress_impl(port, ptr, rust_vec_len, data_len)
         }
-        12 => wire__crate__api__wifi__send_test_packet_impl(port, ptr, rust_vec_len, data_len),
-        13 => {
+        13 => wire__crate__api__wifi__send_test_packet_impl(port, ptr, rust_vec_len, data_len),
+        14 => {
             wire__crate__api__wifi__set_download_directory_impl(port, ptr, rust_vec_len, data_len)
         }
-        14 => wire__crate__api__wifi__start_file_transfer_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__wifi__start_file_transfer_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__wifi__subscribe_events_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -705,7 +821,7 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        7 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -736,6 +852,29 @@ impl flutter_rust_bridge::IntoIntoDart<crate::platform::DiscoveredPeer>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::wifi::RustEvent {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.go_handshake.into_into_dart().into_dart(),
+            self.tcp_message.into_into_dart().into_dart(),
+            self.transfer_progress.into_into_dart().into_dart(),
+            self.vpn_updated.into_into_dart().into_dart(),
+            self.active_vpn.into_into_dart().into_dart(),
+            self.wifi_channel_updated.into_into_dart().into_dart(),
+            self.wifi_channel_info.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::wifi::RustEvent {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::wifi::RustEvent>
+    for crate::api::wifi::RustEvent
+{
+    fn into_into_dart(self) -> crate::api::wifi::RustEvent {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::transfer::progress::TransferProgress {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -761,6 +900,22 @@ impl flutter_rust_bridge::IntoIntoDart<crate::transfer::progress::TransferProgre
 {
     fn into_into_dart(self) -> crate::transfer::progress::TransferProgress {
         self
+    }
+}
+
+impl SseEncode for flutter_rust_bridge::for_generated::anyhow::Error {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(format!("{:?}", self), serializer);
+    }
+}
+
+impl SseEncode
+    for StreamSink<crate::api::wifi::RustEvent, flutter_rust_bridge::for_generated::SseCodec>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        unimplemented!("")
     }
 }
 
@@ -839,6 +994,22 @@ impl SseEncode for Option<crate::transfer::progress::TransferProgress> {
         if let Some(value) = self {
             <crate::transfer::progress::TransferProgress>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::wifi::RustEvent {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Option<String>>::sse_encode(self.go_handshake, serializer);
+        <Option<String>>::sse_encode(self.tcp_message, serializer);
+        <Option<crate::transfer::progress::TransferProgress>>::sse_encode(
+            self.transfer_progress,
+            serializer,
+        );
+        <bool>::sse_encode(self.vpn_updated, serializer);
+        <Option<String>>::sse_encode(self.active_vpn, serializer);
+        <bool>::sse_encode(self.wifi_channel_updated, serializer);
+        <Option<String>>::sse_encode(self.wifi_channel_info, serializer);
     }
 }
 

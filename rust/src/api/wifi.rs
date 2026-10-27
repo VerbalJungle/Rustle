@@ -1,3 +1,4 @@
+use crate::frb_generated::StreamSink;
 use crate::platform::{
     BleDevice, DiscoveredPeer, PlatformBleManager, WifiDirectDevice, WifiDirectManager,
 };
@@ -7,6 +8,84 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
+
+/// Ereignis-Paket, das vom Rust-Backend per StreamSink direkt an Flutter gepusht wird.
+#[derive(Debug, Clone)]
+pub struct RustEvent {
+    pub go_handshake: Option<String>,
+    pub tcp_message: Option<String>,
+    pub transfer_progress: Option<TransferProgress>,
+    pub vpn_updated: bool,
+    pub active_vpn: Option<String>,
+    pub wifi_channel_updated: bool,
+    pub wifi_channel_info: Option<String>,
+}
+
+impl RustEvent {
+    fn from_go_handshake(msg: String) -> Self {
+        Self {
+            go_handshake: Some(msg),
+            tcp_message: None,
+            transfer_progress: None,
+            vpn_updated: false,
+            active_vpn: None,
+            wifi_channel_updated: false,
+            wifi_channel_info: None,
+        }
+    }
+
+    fn from_tcp_message(msg: String) -> Self {
+        Self {
+            go_handshake: None,
+            tcp_message: Some(msg),
+            transfer_progress: None,
+            vpn_updated: false,
+            active_vpn: None,
+            wifi_channel_updated: false,
+            wifi_channel_info: None,
+        }
+    }
+
+    fn from_transfer_progress(progress: TransferProgress) -> Self {
+        Self {
+            go_handshake: None,
+            tcp_message: None,
+            transfer_progress: Some(progress),
+            vpn_updated: false,
+            active_vpn: None,
+            wifi_channel_updated: false,
+            wifi_channel_info: None,
+        }
+    }
+
+    fn from_vpn_status(vpn: Option<String>) -> Self {
+        Self {
+            go_handshake: None,
+            tcp_message: None,
+            transfer_progress: None,
+            vpn_updated: true,
+            active_vpn: vpn,
+            wifi_channel_updated: false,
+            wifi_channel_info: None,
+        }
+    }
+
+    fn from_wifi_channel_info(info: Option<String>) -> Self {
+        Self {
+            go_handshake: None,
+            tcp_message: None,
+            transfer_progress: None,
+            vpn_updated: false,
+            active_vpn: None,
+            wifi_channel_updated: true,
+            wifi_channel_info: info,
+        }
+    }
+}
+
+static EVENT_SINK: Mutex<Option<StreamSink<RustEvent>>> = Mutex::new(None);
+static MONITOR_RUNNING: Mutex<bool> = Mutex::new(false);
 
 static WIFI_MANAGER: Mutex<Option<WifiDirectManager>> = Mutex::new(None);
 static BLE_MANAGER: Mutex<Option<PlatformBleManager>> = Mutex::new(None);
@@ -18,7 +97,7 @@ static INCOMING_TCP_MSG: Mutex<Option<String>> = Mutex::new(None);
 static OUTGOING_TCP_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static TCP_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static IS_CURRENTLY_GO: Mutex<bool> = Mutex::new(false);
-// Speichert die bereits beim GO-Start vorbereiteten Hotspot-Zugangsdaten (Pre-Warming!)
+// Speichert die bereits beim GO-Start vorbereiteten Hotspot-Zugangsdaten (Pre-Warming)
 static ACTIVE_GO_CREDS: Mutex<Option<String>> = Mutex::new(None);
 
 // File Transfer Zustände
@@ -29,6 +108,75 @@ static TRANSFER_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 pub const RUSTLE_TCP_PORT: u16 = 4242;
 pub const RUSTLE_TRANSFER_PORT: u16 = 4243;
 
+fn emit_event(event: RustEvent) {
+    if let Ok(lock) = EVENT_SINK.lock() {
+        if let Some(ref sink) = *lock {
+            let _ = sink.add(event);
+        }
+    }
+}
+
+/// Registriert einen StreamSink für Echtzeit-Events vom Rust-Core an Flutter.
+pub fn subscribe_events(sink: StreamSink<RustEvent>) -> Result<(), String> {
+    if let Ok(mut lock) = EVENT_SINK.lock() {
+        *lock = Some(sink);
+    }
+
+    // Initialen VPN-Status und WLAN-Kanal direkt pushen
+    if let Ok(vpn) = check_active_vpn() {
+        emit_event(RustEvent::from_vpn_status(vpn));
+    }
+    if let Ok(ch_info) = get_active_wifi_channel_info() {
+        emit_event(RustEvent::from_wifi_channel_info(ch_info));
+    }
+
+    ensure_background_monitor_running();
+    Ok(())
+}
+
+fn ensure_background_monitor_running() {
+    let mut running = MONITOR_RUNNING.lock().unwrap();
+    if *running {
+        return;
+    }
+    *running = true;
+
+    thread::spawn(|| {
+        let mut tick: u64 = 0;
+        let mut last_vpn: Option<String> = None;
+        let mut last_channel_info: Option<String> = None;
+
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            tick = tick.wrapping_add(1);
+
+            // Alle ~2 Sekunden VPN-Status und WLAN-Frequenzband/Kanal prüfen und bei Änderung pushen
+            if tick % 8 == 0 {
+                if let Ok(vpn) = check_active_vpn() {
+                    if vpn != last_vpn {
+                        last_vpn = vpn.clone();
+                        emit_event(RustEvent::from_vpn_status(vpn));
+                    }
+                }
+                if let Ok(ch_info) = get_active_wifi_channel_info() {
+                    if ch_info != last_channel_info {
+                        last_channel_info = ch_info.clone();
+                        emit_event(RustEvent::from_wifi_channel_info(ch_info));
+                    }
+                }
+            }
+
+            // Falls wir GO sind, auf eingehende GATT-Handshakes prüfen (Fallback für Nicht-Connectionless)
+            let is_go = *IS_CURRENTLY_GO.lock().unwrap();
+            if is_go {
+                if let Ok(Some(event)) = ble_poll_and_handle_go() {
+                    emit_event(RustEvent::from_go_handshake(event));
+                }
+            }
+        }
+    });
+}
+
 pub fn init_core() -> Result<String, String> {
     let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
     *wifi = Some(WifiDirectManager::new());
@@ -38,6 +186,7 @@ pub fn init_core() -> Result<String, String> {
 
     ensure_tcp_server_running();
     ensure_transfer_server_running();
+    ensure_background_monitor_running();
 
     Ok("Rust Core (BLE + Wi-Fi Direct + TCP :4242/:4243) initialisiert".into())
 }
@@ -45,6 +194,11 @@ pub fn init_core() -> Result<String, String> {
 /// Prüft, ob ein aktives VPN auf dem Gerät läuft (Android oder Linux)
 pub fn check_active_vpn() -> Result<Option<String>, String> {
     crate::platform::check_active_vpn_platform()
+}
+
+/// Liest das aktuell genutzte WLAN-Frequenzband und den Kanal aus (z. B. "5 GHz • Ch 36")
+pub fn get_active_wifi_channel_info() -> Result<Option<String>, String> {
+    crate::platform::get_active_wifi_channel_info_platform()
 }
 
 pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, String> {
@@ -56,12 +210,16 @@ pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, S
         OUTGOING_TCP_QUEUE.lock().unwrap().clear();
 
         // PRE-WARMING: Startet den Wi-Fi Direct GO (Hotspot) direkt beim Aktivieren des GO-Modus
-        // und hinterlege die Zugangsdaten (SSID;PSK;IP) im GATT-Server & BLE Advertising!
+        // und hinterlegt die Zugangsdaten (SSID;PSK;IP) im GATT-Server bzw. BLE Advertising
         let prewarmed_creds = {
             let mut wifi = WIFI_MANAGER.lock().map_err(|e| e.to_string())?;
             let w_mgr = wifi.as_mut().ok_or("Wi-Fi Manager nicht initialisiert")?;
             w_mgr.start_hotspot("DIRECT-RustleGO".into(), "rustle42".into())?
         };
+
+        if let Ok(ch_info) = get_active_wifi_channel_info() {
+            emit_event(RustEvent::from_wifi_channel_info(ch_info));
+        }
 
         if !prewarmed_creds.starts_with("ERR:") {
             *ACTIVE_GO_CREDS.lock().unwrap() = Some(prewarmed_creds.clone());
@@ -111,6 +269,8 @@ pub fn ble_stop_broadcast() -> Result<String, String> {
         }
     };
 
+    emit_event(RustEvent::from_wifi_channel_info(None));
+
     Ok(format!("Reset durchgeführt: {} | {}", ble_msg, wifi_msg))
 }
 
@@ -154,6 +314,10 @@ pub fn ble_poll_and_handle_go() -> Result<Option<String>, String> {
                 c
             }
         };
+
+        if let Ok(ch_info) = get_active_wifi_channel_info() {
+            emit_event(RustEvent::from_wifi_channel_info(ch_info));
+        }
 
         return Ok(Some(format!(
             "Anfrage '{}' -> Wi-Fi Direct GO & TCP-Server (:4242/:4243) bereit! ({})",
@@ -211,6 +375,10 @@ pub fn ble_handshake_and_join_wifi(
         return Err(wifi_res);
     }
 
+    if let Ok(ch_info) = get_active_wifi_channel_info() {
+        emit_event(RustEvent::from_wifi_channel_info(ch_info));
+    }
+
     // Hintergrund-Worker für INIT_PING und Rückkanal-Polling
     let target = go_ip.clone();
     std::thread::spawn(move || {
@@ -234,8 +402,9 @@ pub fn ble_handshake_and_join_wifi(
                     if !msg_content.is_empty() {
                         println!("[RUST DEBUG] Vom GO über Poll empfangen: {}", msg_content);
                         if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
-                            *inbox = Some(msg_content);
+                            *inbox = Some(msg_content.clone());
                         }
+                        emit_event(RustEvent::from_tcp_message(msg_content));
                     }
                 }
             }
@@ -339,8 +508,6 @@ pub fn start_file_transfer(file_path: String) -> Result<String, String> {
     let path_clone = file_path.clone();
 
     std::thread::spawn(move || {
-        use std::time::Duration;
-
         println!(
             "[RUST TRANSFER] Verbinde zu {}:{} für Datei '{}' (VPN-Bypass aktiv)...",
             target, RUSTLE_TRANSFER_PORT, path_clone
@@ -364,6 +531,10 @@ pub fn start_file_transfer(file_path: String) -> Result<String, String> {
             }
         };
 
+        if let Ok(ch_info) = get_active_wifi_channel_info() {
+            emit_event(RustEvent::from_wifi_channel_info(ch_info));
+        }
+
         let file_id = format!(
             "file_{}",
             std::time::SystemTime::now()
@@ -380,6 +551,7 @@ pub fn start_file_transfer(file_path: String) -> Result<String, String> {
                 if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
                     *lock = Some(progress.clone());
                 }
+                emit_event(RustEvent::from_transfer_progress(progress.clone()));
             },
         );
 
@@ -419,6 +591,7 @@ fn ensure_tcp_server_running() {
 
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
+                let _ = stream.set_nodelay(true);
                 let mut s = stream;
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
@@ -443,14 +616,14 @@ fn ensure_tcp_server_running() {
                                 peer_ip_opt
                             );
                             if let Some(ip) = peer_ip_opt {
+                                let sys_msg =
+                                    format!("[System] Client verbunden (IP: {}) - Bereit!", ip);
                                 if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
                                     if inbox.is_none() {
-                                        *inbox = Some(format!(
-                                            "[System] Client verbunden (IP: {}) - Bereit!",
-                                            ip
-                                        ));
+                                        *inbox = Some(sys_msg.clone());
                                     }
                                 }
+                                emit_event(RustEvent::from_tcp_message(sys_msg));
                             }
                             let next_out = OUTGOING_TCP_QUEUE.lock().unwrap().pop_front();
                             let reply = match next_out {
@@ -478,6 +651,7 @@ fn ensure_tcp_server_running() {
                             if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
                                 *inbox = Some(msg.clone());
                             }
+                            emit_event(RustEvent::from_tcp_message(msg.clone()));
                             let reply = format!("ACK: Empfangen ({})", msg);
                             let _ = s.write_all(reply.as_bytes());
                             let _ = s.flush();
@@ -528,6 +702,10 @@ fn ensure_transfer_server_running() {
                     save_dir
                 );
 
+                if let Ok(ch_info) = get_active_wifi_channel_info() {
+                    emit_event(RustEvent::from_wifi_channel_info(ch_info));
+                }
+
                 let res = crate::transfer::FileReceiver::receive_file(
                     &mut s,
                     &save_dir,
@@ -535,6 +713,7 @@ fn ensure_transfer_server_running() {
                         if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
                             *lock = Some(progress.clone());
                         }
+                        emit_event(RustEvent::from_transfer_progress(progress.clone()));
                     },
                 );
 
@@ -556,12 +735,11 @@ fn ensure_transfer_server_running() {
                             "[RUST TRANSFER] Datei erfolgreich gespeichert: {}",
                             final_display_path
                         );
+                        let received_msg = format!("[Datei empfangen] {}", final_display_path);
                         if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
-                            *inbox = Some(format!(
-                                "[Datei empfangen] {}",
-                                final_display_path
-                            ));
+                            *inbox = Some(received_msg.clone());
                         }
+                        emit_event(RustEvent::from_tcp_message(received_msg));
                     }
                     Err(e) => {
                         println!("[RUST TRANSFER] Empfangs-Fehler: {}", e);

@@ -9,13 +9,22 @@ import '../transfer/progress.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `ensure_tcp_server_running`, `ensure_transfer_server_running`
+// These functions are ignored because they are not marked as `pub`: `emit_event`, `ensure_background_monitor_running`, `ensure_tcp_server_running`, `ensure_transfer_server_running`, `from_go_handshake`, `from_tcp_message`, `from_transfer_progress`, `from_vpn_status`, `from_wifi_channel_info`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
+
+/// Registriert einen StreamSink für Echtzeit-Events vom Rust-Core an Flutter.
+Stream<RustEvent> subscribeEvents() =>
+    RustLib.instance.api.crateApiWifiSubscribeEvents();
 
 Future<String> initCore() => RustLib.instance.api.crateApiWifiInitCore();
 
 /// Prüft, ob ein aktives VPN auf dem Gerät läuft (Android oder Linux)
 Future<String?> checkActiveVpn() =>
     RustLib.instance.api.crateApiWifiCheckActiveVpn();
+
+/// Liest das aktuell genutzte WLAN-Frequenzband und den Kanal aus (z. B. "5 GHz • Ch 36")
+Future<String?> getActiveWifiChannelInfo() =>
+    RustLib.instance.api.crateApiWifiGetActiveWifiChannelInfo();
 
 Future<String> bleStartBroadcast({
   required String deviceName,
@@ -63,3 +72,47 @@ Future<TransferProgress?> pollTransferProgress() =>
 /// Startet das Streaming einer Datei an den verbundenen Peer im Hintergrund
 Future<String> startFileTransfer({required String filePath}) =>
     RustLib.instance.api.crateApiWifiStartFileTransfer(filePath: filePath);
+
+/// Ereignis-Paket, das vom Rust-Backend per StreamSink direkt an Flutter gepusht wird.
+class RustEvent {
+  final String? goHandshake;
+  final String? tcpMessage;
+  final TransferProgress? transferProgress;
+  final bool vpnUpdated;
+  final String? activeVpn;
+  final bool wifiChannelUpdated;
+  final String? wifiChannelInfo;
+
+  const RustEvent({
+    this.goHandshake,
+    this.tcpMessage,
+    this.transferProgress,
+    required this.vpnUpdated,
+    this.activeVpn,
+    required this.wifiChannelUpdated,
+    this.wifiChannelInfo,
+  });
+
+  @override
+  int get hashCode =>
+      goHandshake.hashCode ^
+      tcpMessage.hashCode ^
+      transferProgress.hashCode ^
+      vpnUpdated.hashCode ^
+      activeVpn.hashCode ^
+      wifiChannelUpdated.hashCode ^
+      wifiChannelInfo.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RustEvent &&
+          runtimeType == other.runtimeType &&
+          goHandshake == other.goHandshake &&
+          tcpMessage == other.tcpMessage &&
+          transferProgress == other.transferProgress &&
+          vpnUpdated == other.vpnUpdated &&
+          activeVpn == other.activeVpn &&
+          wifiChannelUpdated == other.wifiChannelUpdated &&
+          wifiChannelInfo == other.wifiChannelInfo;
+}
