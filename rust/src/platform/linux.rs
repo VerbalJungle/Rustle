@@ -1339,30 +1339,6 @@ pub fn create_connected_wifi_stream(
     Ok(stream)
 }
 
-pub fn send_tcp_packet_platform(
-    target_ip: &str,
-    port: u16,
-    message: &str,
-) -> Result<String, String> {
-    use std::io::{Read, Write};
-
-    println!("[LINUX TCP] Sende Nachricht an {}:{}", target_ip, port);
-    let mut stream = create_connected_wifi_stream(target_ip, port, Duration::from_secs(3))?;
-
-    stream
-        .write_all(message.as_bytes())
-        .map_err(|e| format!("Senden fehlgeschlagen: {}", e))?;
-    let _ = stream.flush();
-
-    let mut buf = [0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .map_err(|e| format!("Keine Antwort vom Peer: {}", e))?;
-
-    let reply = String::from_utf8_lossy(&buf[..n]).to_string();
-    Ok(format!("Antwort vom Peer: {}", reply))
-}
-
 pub fn export_file_to_downloads_platform(file_path: &std::path::Path) -> Result<String, String> {
     Ok(file_path.to_string_lossy().to_string())
 }

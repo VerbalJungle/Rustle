@@ -90,6 +90,7 @@ pub fn create_connected_wifi_stream(
                 return Err(format!("Ungültiger File Descriptor: {}", fd));
             }
             let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+            let _ = stream.set_nodelay(true);
             stream.set_read_timeout(Some(timeout)).ok();
             stream.set_write_timeout(Some(timeout)).ok();
             Ok(stream)
@@ -216,30 +217,6 @@ impl BleDevice for AndroidBleManager {
             &[JValue::Object(&j_creds)],
         )?;
         Ok(())
-    }
-}
-
-pub fn send_tcp_packet_platform(target_ip: &str, port: u16, message: &str) -> Result<String, String> {
-    let vm = JVM.get().ok_or("JavaVM fehlt")?;
-    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-
-    let j_ip = env.new_string(target_ip).map_err(|e| e.to_string())?;
-    let j_msg = env.new_string(message).map_err(|e| e.to_string())?;
-
-    let res = call_kotlin_bridge(
-        "sendTcpPacketOverWifi",
-        "(Ljava/lang/String;ILjava/lang/String;)Ljava/lang/String;",
-        &[
-            JValue::Object(&j_ip),
-            JValue::Int(port as i32),
-            JValue::Object(&j_msg),
-        ],
-    )?;
-
-    if res.starts_with("ERR:") {
-        Err(res)
-    } else {
-        Ok(res)
     }
 }
 

@@ -34,6 +34,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+
 @SuppressLint("MissingPermission")
 object NativeWifiBridge {
     private var appContext: Context? = null
@@ -1411,55 +1412,6 @@ object NativeWifiBridge {
             if (!future.isDone) {
                 future.complete("EXC: ${e.message}")
             }
-        }
-    }
-
-    @JvmStatic
-    fun sendTcpPacketOverWifi(targetIp: String, port: Int, message: String): String {
-        return try {
-            val cleanIp = targetIp.trim()
-            val targetInet = Inet4Address.getByName(cleanIp)
-
-            val localSubnetAddr = findLocalIpInSameSubnet(cleanIp)
-            val targetNet = activeWifiNetwork ?: findNetworkForInterfaceOrIp(cleanIp)
-
-            val socket: Socket = if (targetNet != null) {
-                targetNet.socketFactory.createSocket().also { s ->
-                    try {
-                        targetNet.bindSocket(s)
-                    } catch (e: Exception) {
-                        println("Hinweis bindSocket: ${e.message}")
-                    }
-                }
-            } else if (localSubnetAddr != null) {
-                Socket().also { rawSocket ->
-                    try {
-                        rawSocket.bind(InetSocketAddress(localSubnetAddr, 0))
-                    } catch (e: Exception) {
-                        println("Warnung: Konnte Socket nicht an P2P-IP $localSubnetAddr binden: ${e.message}")
-                    }
-                }
-            } else {
-                Socket()
-            }
-
-            socket.soTimeout = 4000
-            socket.connect(InetSocketAddress(targetInet, port), 4000)
-
-            val out = socket.getOutputStream()
-            out.write(message.toByteArray(Charsets.UTF_8))
-            out.flush()
-
-            val input = socket.getInputStream()
-            val buf = ByteArray(4096)
-            val read = input.read(buf)
-            val reply = if (read > 0) String(buf, 0, read, Charsets.UTF_8) else "OK"
-
-            socket.close()
-            "Erfolg: $reply"
-        } catch (e: Throwable) {
-            println("TCP Fehler Details: ${e.javaClass.simpleName}: ${e.message}")
-            "ERR: ${e.javaClass.simpleName}: ${e.message}"
         }
     }
 

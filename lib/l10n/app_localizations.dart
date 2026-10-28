@@ -143,7 +143,7 @@ abstract class AppLocalizations {
   /// No description provided for @vpnActive.
   ///
   /// In en, this message translates to:
-  /// **'VPN {vpnName} active, if you encounter any problems please try to deactivate it'**
+  /// **'VPN {vpnName} is active. If you encounter any issues, try to disable it'**
   String vpnActive(String vpnName);
 
   /// No description provided for @scan.
@@ -269,7 +269,7 @@ abstract class AppLocalizations {
   /// No description provided for @readyToSendFile.
   ///
   /// In en, this message translates to:
-  /// **'Ready to send files'**
+  /// **'Ready to send file'**
   String get readyToSendFile;
 
   /// No description provided for @tooltipsSettings.

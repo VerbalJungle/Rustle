@@ -4,8 +4,8 @@ use crate::platform::{
 };
 pub use crate::transfer::TransferProgress;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -94,7 +94,9 @@ static BLE_MANAGER: Mutex<Option<PlatformBleManager>> = Mutex::new(None);
 // Speichert die IP des Peers (auf Client: GO-IP; auf GO: gelernte Client-IP)
 static PEER_IP: Mutex<Option<String>> = Mutex::new(None);
 static INCOMING_TCP_MSG: Mutex<Option<String>> = Mutex::new(None);
-// Ausgehende Nachrichten-Warteschlange (wird für GO -> Client über die vom Client aufgebaute TCP-Verbindung zugestellt, falls Firewall/EACCES direktes Connect blockiert)
+// Persistenter, bidirektionaler TCP-Stream für den Kontroll- und Nachrichtenkanal (:4242)
+static ACTIVE_CONTROL_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
+// Ausgehende Nachrichten-Warteschlange (wird direkt beim Aufbau des persistenten Streams zugestellt, falls eine Nachricht vor dem Handshake gesendet wurde)
 static OUTGOING_TCP_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static TCP_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
 static IS_CURRENTLY_GO: Mutex<bool> = Mutex::new(false);
@@ -114,6 +116,142 @@ fn emit_event(event: RustEvent) {
     if let Ok(lock) = EVENT_SINK.lock() {
         if let Some(ref sink) = *lock {
             let _ = sink.add(event);
+        }
+    }
+}
+
+fn close_active_control_stream() {
+    if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+        if let Some(stream) = lock.take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+fn write_line_to_stream(stream: &mut TcpStream, line: &str) -> Result<(), String> {
+    let clean = line.replace('\r', " ").replace('\n', " ");
+    let framed = format!("{}\n", clean);
+    stream
+        .write_all(framed.as_bytes())
+        .map_err(|e| format!("Fehler beim Schreiben auf TCP-Stream: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("Fehler beim Flushen des TCP-Streams: {}", e))?;
+    Ok(())
+}
+
+/// Registriert einen verbundenen Kontroll-Stream (:4242) als kontinuierliche, bidirektionale Leitung
+/// und verarbeitet eingehende Zeilen in Echtzeit, bis die Verbindung getrennt wird.
+fn handle_persistent_control_stream(stream: TcpStream, peer_ip_opt: Option<String>) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(None); // Blockierendes Lesen für kontinuierlichen Stream
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let write_clone = match stream.try_clone() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[RUST TCP] Konnte Stream nicht klonen: {}", e);
+            return;
+        }
+    };
+
+    // Speichere die Schreib-Hälfte global und spüle ggf. wartende Nachrichten sofort heraus
+    {
+        if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+            if let Some(old) = lock.take() {
+                let _ = old.shutdown(Shutdown::Both);
+            }
+            *lock = Some(write_clone);
+        }
+
+        let mut queued_msgs = Vec::new();
+        if let Ok(mut q) = OUTGOING_TCP_QUEUE.lock() {
+            while let Some(msg) = q.pop_front() {
+                queued_msgs.push(msg);
+            }
+        }
+
+        if !queued_msgs.is_empty() {
+            if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+                if let Some(ref mut active_s) = *lock {
+                    for msg in queued_msgs {
+                        let _ = write_line_to_stream(active_s, &format!("MSG:{}", msg));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                println!(
+                    "[RUST TCP] Kontinuierlicher Stream zu {:?} wurde vom Peer geschlossen (EOF).",
+                    peer_ip_opt
+                );
+                break;
+            }
+            Ok(_) => {
+                let msg = line.trim();
+                if msg.is_empty() {
+                    continue;
+                }
+
+                if msg == "INIT_PING" {
+                    println!(
+                        "[RUST DEBUG] INIT_PING über kontinuierlichen Stream von {:?} empfangen",
+                        peer_ip_opt
+                    );
+                    if let Some(ref ip) = peer_ip_opt {
+                        let sys_msg = format!("[System] Client verbunden (IP: {}) - Bereit!", ip);
+                        if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
+                            if inbox.is_none() {
+                                *inbox = Some(sys_msg.clone());
+                            }
+                        }
+                        emit_event(RustEvent::from_tcp_message(sys_msg));
+                    }
+                    if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+                        if let Some(ref mut s) = *lock {
+                            let _ = write_line_to_stream(s, "ACK:INIT_OK");
+                        }
+                    }
+                } else if msg == "ACK:INIT_OK" || msg == "POLL" || msg == "ACK:EMPTY" {
+                    // Handshake-Bestätigung oder Legacy-Keepalive -> nichts im UI anzeigen
+                } else if let Some(ack_rest) = msg.strip_prefix("ACK:") {
+                    println!("[RUST DEBUG] ACK vom Peer erhalten: {}", ack_rest.trim());
+                } else {
+                    let content = msg.strip_prefix("MSG:").unwrap_or(msg).trim().to_string();
+                    if !content.is_empty() {
+                        println!(
+                            "[RUST DEBUG] Nachricht über kontinuierlichen Stream empfangen: {}",
+                            content
+                        );
+                        if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
+                            *inbox = Some(content.clone());
+                        }
+                        emit_event(RustEvent::from_tcp_message(content.clone()));
+
+                        if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+                            if let Some(ref mut s) = *lock {
+                                let _ =
+                                    write_line_to_stream(s, &format!("ACK: Empfangen ({})", content));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!(
+                    "[RUST TCP] Lesefehler auf kontinuierlichem Stream ({:?}): {}",
+                    peer_ip_opt, e
+                );
+                break;
+            }
         }
     }
 }
@@ -206,6 +344,7 @@ pub fn get_active_wifi_channel_info() -> Result<Option<String>, String> {
 pub fn ble_start_broadcast(device_name: String, is_go: bool) -> Result<String, String> {
     ensure_tcp_server_running();
     ensure_transfer_server_running();
+    close_active_control_stream();
     *IS_CURRENTLY_GO.lock().unwrap() = is_go;
     if is_go {
         *PEER_IP.lock().unwrap() = None;
@@ -249,6 +388,7 @@ pub fn ble_stop_broadcast() -> Result<String, String> {
     *PEER_IP.lock().unwrap() = None;
     *ACTIVE_GO_CREDS.lock().unwrap() = None;
     OUTGOING_TCP_QUEUE.lock().unwrap().clear();
+    close_active_control_stream();
     TRANSFER_CANCELLED.store(true, Ordering::SeqCst);
     if let Ok(mut p) = ACTIVE_TRANSFER_PROGRESS.lock() {
         *p = None;
@@ -338,6 +478,7 @@ pub fn ble_handshake_and_join_wifi(
 ) -> Result<String, String> {
     *IS_CURRENTLY_GO.lock().unwrap() = false;
     OUTGOING_TCP_QUEUE.lock().unwrap().clear();
+    close_active_control_stream();
 
     let creds = {
         let mut ble = BLE_MANAGER.lock().map_err(|e| e.to_string())?;
@@ -382,10 +523,11 @@ pub fn ble_handshake_and_join_wifi(
         emit_event(RustEvent::from_wifi_channel_info(ch_info));
     }
 
-    // Hintergrund-Worker für INIT_PING und Rückkanal-Polling
+    // Hintergrund-Worker für den kontinuierlichen, bidirektionalen Kontroll-Stream (:4242)
+    // Öffnet den Socket nur EINMALig (mit automatischem Reconnect bei Verbindungsabbruch)
+    // statt alle 450ms einen neuen Socket zu erzeugen!
     let target = go_ip.clone();
     std::thread::spawn(move || {
-        let mut init_done = false;
         loop {
             if *IS_CURRENTLY_GO.lock().unwrap() {
                 break;
@@ -395,23 +537,33 @@ pub fn ble_handshake_and_join_wifi(
                 break;
             }
 
-            let probe = if !init_done { "INIT_PING" } else { "POLL" };
-            if let Ok(reply) =
-                crate::platform::send_tcp_packet_platform(&target, RUSTLE_TCP_PORT, probe)
-            {
-                init_done = true;
-                if let Some(idx) = reply.find("MSG:") {
-                    let msg_content = reply[idx + 4..].trim().to_string();
-                    if !msg_content.is_empty() {
-                        println!("[RUST DEBUG] Vom GO über Poll empfangen: {}", msg_content);
-                        if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
-                            *inbox = Some(msg_content.clone());
-                        }
-                        emit_event(RustEvent::from_tcp_message(msg_content));
+            match crate::platform::create_connected_wifi_stream(
+                &target,
+                RUSTLE_TCP_PORT,
+                Duration::from_secs(4),
+            ) {
+                Ok(mut stream) => {
+                    println!(
+                        "[RUST TCP] Kontinuierlicher Kontroll-Stream zu {}:{} hergestellt!",
+                        target, RUSTLE_TCP_PORT
+                    );
+                    if let Err(e) = write_line_to_stream(&mut stream, "INIT_PING") {
+                        println!("[RUST TCP] Fehler beim Senden von INIT_PING: {}", e);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
                     }
+                    // Blockiert und liest kontinuierlich auf demselben Socket, bis die Verbindung endet
+                    handle_persistent_control_stream(stream, Some(target.clone()));
+                }
+                Err(e) => {
+                    println!(
+                        "[RUST TCP] Warte auf Kontroll-Stream zu {}:{} ({})...",
+                        target, RUSTLE_TCP_PORT, e
+                    );
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(450));
+
+            std::thread::sleep(Duration::from_millis(800));
         }
     });
 
@@ -437,26 +589,60 @@ pub fn send_test_packet(payload: String) -> Result<String, String> {
 
     let is_go = *IS_CURRENTLY_GO.lock().unwrap();
 
-    println!("[RUST DEBUG] Sende Testpaket an IP: {}", target_ip);
-    match crate::platform::send_tcp_packet_platform(&target_ip, RUSTLE_TCP_PORT, &payload) {
-        Ok(res) => Ok(res),
+    // 1. Primärer Pfad: Direkt über den bereits offenen, kontinuierlichen TCP-Stream senden (kein neuer Socket!)
+    let mut sent_over_persistent = false;
+    if let Ok(mut lock) = ACTIVE_CONTROL_STREAM.lock() {
+        if let Some(ref mut stream) = *lock {
+            match write_line_to_stream(stream, &format!("MSG:{}", payload)) {
+                Ok(()) => {
+                    sent_over_persistent = true;
+                }
+                Err(e) => {
+                    println!(
+                        "[RUST TCP] Persistenter Stream nicht mehr beschreibbar ({}), baue neu auf...",
+                        e
+                    );
+                    *lock = None;
+                }
+            }
+        }
+    }
+
+    if sent_over_persistent {
+        return Ok(format!(
+            "Über kontinuierlichen Stream an {} gesendet: {}",
+            target_ip, payload
+        ));
+    }
+
+    // 2. Falls noch kein persistenter Stream offen ist: Jetzt einmalig öffnen und als kontinuierlichen Stream behalten
+    println!(
+        "[RUST DEBUG] Öffne neuen kontinuierlichen Stream zu {}:{}...",
+        target_ip, RUSTLE_TCP_PORT
+    );
+    match crate::platform::create_connected_wifi_stream(
+        &target_ip,
+        RUSTLE_TCP_PORT,
+        Duration::from_secs(3),
+    ) {
+        Ok(mut stream) => {
+            write_line_to_stream(&mut stream, &format!("MSG:{}", payload))?;
+            let ip_clone = target_ip.clone();
+            std::thread::spawn(move || {
+                handle_persistent_control_stream(stream, Some(ip_clone));
+            });
+            Ok(format!(
+                "Kontinuierlicher Stream geöffnet & gesendet an {}: {}",
+                target_ip, payload
+            ))
+        }
         Err(err) => {
             if is_go {
                 println!(
-                    "[RUST DEBUG] Direktes Senden vom GO blockiert ({}), stelle über Client-Rückkanal zu...",
+                    "[RUST DEBUG] Direktes Öffnen vom GO nicht möglich ({}), reihe für Client-Stream ein...",
                     err
                 );
                 OUTGOING_TCP_QUEUE.lock().unwrap().push_back(payload.clone());
-
-                for _ in 0..25 {
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    if OUTGOING_TCP_QUEUE.lock().unwrap().is_empty() {
-                        return Ok(format!(
-                            "Erfolg: Vom Client empfangen ({}) [via Rückkanal]",
-                            payload
-                        ));
-                    }
-                }
                 Ok(format!(
                     "In Warteschlange für Client ({}) bereitgestellt!",
                     target_ip
@@ -606,13 +792,8 @@ fn ensure_tcp_server_running() {
 
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
-                let _ = stream.set_nodelay(true);
-                let mut s = stream;
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-
                 let mut peer_ip_opt = None;
-                if let Ok(peer_addr) = s.peer_addr() {
+                if let Ok(peer_addr) = stream.peer_addr() {
                     let ip_str = peer_addr.ip().to_string().replace("::ffff:", "");
                     if ip_str != "127.0.0.1" && ip_str != "::1" {
                         *PEER_IP.lock().unwrap() = Some(ip_str.clone());
@@ -620,59 +801,11 @@ fn ensure_tcp_server_running() {
                     }
                 }
 
-                let mut buf = [0u8; 4096];
-                if let Ok(n) = s.read(&mut buf) {
-                    if n > 0 {
-                        let msg = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                        if msg == "INIT_PING" {
-                            println!(
-                                "[RUST DEBUG] INIT_PING von Peer {:?} empfangen",
-                                peer_ip_opt
-                            );
-                            if let Some(ip) = peer_ip_opt {
-                                let sys_msg =
-                                    format!("[System] Client verbunden (IP: {}) - Bereit!", ip);
-                                if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
-                                    if inbox.is_none() {
-                                        *inbox = Some(sys_msg.clone());
-                                    }
-                                }
-                                emit_event(RustEvent::from_tcp_message(sys_msg));
-                            }
-                            let next_out = OUTGOING_TCP_QUEUE.lock().unwrap().pop_front();
-                            let reply = match next_out {
-                                Some(queued) => format!("MSG:{}", queued),
-                                None => "ACK:INIT_OK".to_string(),
-                            };
-                            let _ = s.write_all(reply.as_bytes());
-                            let _ = s.flush();
-                        } else if msg == "POLL" {
-                            let next_out = OUTGOING_TCP_QUEUE.lock().unwrap().pop_front();
-                            let reply = match next_out {
-                                Some(queued) => {
-                                    println!(
-                                        "[RUST DEBUG] Liefere ausgehende GO-Nachricht an Client aus: {}",
-                                        queued
-                                    );
-                                    format!("MSG:{}", queued)
-                                }
-                                None => "ACK:EMPTY".to_string(),
-                            };
-                            let _ = s.write_all(reply.as_bytes());
-                            let _ = s.flush();
-                        } else {
-                            println!("[RUST DEBUG] TCP-Nachricht empfangen: {}", msg);
-                            if let Ok(mut inbox) = INCOMING_TCP_MSG.lock() {
-                                *inbox = Some(msg.clone());
-                            }
-                            emit_event(RustEvent::from_tcp_message(msg.clone()));
-                            let reply = format!("ACK: Empfangen ({})", msg);
-                            let _ = s.write_all(reply.as_bytes());
-                            let _ = s.flush();
-                        }
-                    }
-                }
+                println!(
+                    "[RUST TCP] Eingehende persistente Kontroll-Verbindung von {:?}",
+                    peer_ip_opt
+                );
+                handle_persistent_control_stream(stream, peer_ip_opt);
             });
         }
     });

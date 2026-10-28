@@ -35,7 +35,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String vpnActive(String vpnName) {
-    return 'VPN $vpnName active, if you encounter any problems please try to deactivate it';
+    return 'VPN $vpnName is active. If you encounter any issues, try to disable it';
   }
 
   @override
@@ -107,7 +107,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get connected => 'Connected';
 
   @override
-  String get readyToSendFile => 'Ready to send files';
+  String get readyToSendFile => 'Ready to send file';
 
   @override
   String get tooltipsSettings => 'Settings';
