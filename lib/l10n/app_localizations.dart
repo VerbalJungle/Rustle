@@ -110,6 +110,12 @@ abstract class AppLocalizations {
   /// **'Ready to receive'**
   String get statusHeader;
 
+  /// No description provided for @initBLEAndWiFi.
+  ///
+  /// In en, this message translates to:
+  /// **'Initialise BLE and WiFi'**
+  String get initBLEAndWiFi;
+
   /// No description provided for @resetConnectionStatus.
   ///
   /// In en, this message translates to:
@@ -119,14 +125,20 @@ abstract class AppLocalizations {
   /// No description provided for @finishedConnectionReset.
   ///
   /// In en, this message translates to:
-  /// **'Connection reseted, old WiFi active again'**
+  /// **'Connection reset, reconnected to previous WiFi'**
   String get finishedConnectionReset;
 
   /// No description provided for @error.
   ///
   /// In en, this message translates to:
-  /// **'Error:'**
-  String get error;
+  /// **'Error: {e}'**
+  String error(String e);
+
+  /// No description provided for @errorInit.
+  ///
+  /// In en, this message translates to:
+  /// **'Initialisation error'**
+  String get errorInit;
 
   /// No description provided for @vpnActive.
   ///
@@ -158,6 +170,18 @@ abstract class AppLocalizations {
   /// **'Currently hosting'**
   String get hosting;
 
+  /// No description provided for @stopHosting.
+  ///
+  /// In en, this message translates to:
+  /// **'Stop hosting'**
+  String get stopHosting;
+
+  /// No description provided for @stoppedHosting.
+  ///
+  /// In en, this message translates to:
+  /// **'Stopped hosting'**
+  String get stoppedHosting;
+
   /// No description provided for @connectedTo.
   ///
   /// In en, this message translates to:
@@ -176,11 +200,23 @@ abstract class AppLocalizations {
   /// **'Sending file'**
   String get isSending;
 
+  /// No description provided for @sendFileTo.
+  ///
+  /// In en, this message translates to:
+  /// **'Sending {filename} to {peername}'**
+  String sendFileTo(String filename, String peername);
+
   /// No description provided for @finished.
   ///
   /// In en, this message translates to:
   /// **'Finished'**
   String get finished;
+
+  /// No description provided for @finishedTransfer.
+  ///
+  /// In en, this message translates to:
+  /// **'Finished transfer'**
+  String get finishedTransfer;
 
   /// No description provided for @remaining.
   ///
@@ -188,11 +224,11 @@ abstract class AppLocalizations {
   /// **'Remaining: {seconds}'**
   String remaining(String seconds);
 
-  /// No description provided for @abortTransfer.
+  /// No description provided for @cancelTransfer.
   ///
   /// In en, this message translates to:
-  /// **'Abort transfer'**
-  String get abortTransfer;
+  /// **'Cancel transfer'**
+  String get cancelTransfer;
 
   /// No description provided for @sendAnotherFile.
   ///
@@ -205,6 +241,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Available devices'**
   String get availableDevices;
+
+  /// No description provided for @devicesAvailable.
+  ///
+  /// In en, this message translates to:
+  /// **'{number} Devices available'**
+  String devicesAvailable(int number);
 
   /// No description provided for @lookingForDevices.
   ///
@@ -247,6 +289,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Reset Connections'**
   String get tooltipReset;
+
+  /// No description provided for @blank.
+  ///
+  /// In en, this message translates to:
+  /// **'{b}'**
+  String blank(String b);
 }
 
 class _AppLocalizationsDelegate

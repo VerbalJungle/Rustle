@@ -16,14 +16,22 @@ class AppLocalizationsEn extends AppLocalizations {
   String get statusHeader => 'Ready to receive';
 
   @override
+  String get initBLEAndWiFi => 'Initialise BLE and WiFi';
+
+  @override
   String get resetConnectionStatus => 'Reset WiFi and BLE';
 
   @override
   String get finishedConnectionReset =>
-      'Connection reseted, old WiFi active again';
+      'Connection reset, reconnected to previous WiFi';
 
   @override
-  String get error => 'Error:';
+  String error(String e) {
+    return 'Error: $e';
+  }
+
+  @override
+  String get errorInit => 'Initialisation error';
 
   @override
   String vpnActive(String vpnName) {
@@ -43,6 +51,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get hosting => 'Currently hosting';
 
   @override
+  String get stopHosting => 'Stop hosting';
+
+  @override
+  String get stoppedHosting => 'Stopped hosting';
+
+  @override
   String connectedTo(String peerName) {
     return 'Connected to: $peerName';
   }
@@ -54,7 +68,15 @@ class AppLocalizationsEn extends AppLocalizations {
   String get isSending => 'Sending file';
 
   @override
+  String sendFileTo(String filename, String peername) {
+    return 'Sending $filename to $peername';
+  }
+
+  @override
   String get finished => 'Finished';
+
+  @override
+  String get finishedTransfer => 'Finished transfer';
 
   @override
   String remaining(String seconds) {
@@ -62,13 +84,18 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
-  String get abortTransfer => 'Abort transfer';
+  String get cancelTransfer => 'Cancel transfer';
 
   @override
   String get sendAnotherFile => 'Send another file';
 
   @override
   String get availableDevices => 'Available devices';
+
+  @override
+  String devicesAvailable(int number) {
+    return '$number Devices available';
+  }
 
   @override
   String get lookingForDevices => 'Looking for nearby devices...';
@@ -90,4 +117,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get tooltipReset => 'Reset Connections';
+
+  @override
+  String blank(String b) {
+    return '$b';
+  }
 }

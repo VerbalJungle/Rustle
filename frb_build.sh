@@ -11,6 +11,7 @@ echo "3/3 Bereinige gecachte .so-Libraries im Flutter-Linux-Build..."
 rm -f build/linux/x64/debug/bundle/lib/librust_lib_rustle.so
 rm -f build/linux/x64/release/bundle/lib/librust_lib_rustle.so
 find build/ -name "librust_lib_rustle.so" -delete 2>/dev/null || true
+flutter gen-l10n
 
 # Falls noch ein altes Hotspot-Profil in NetworkManager hängt, vorsorglich löschen:
 nmcli connection delete Rust_Hotspot 2>/dev/null || true

@@ -3,10 +3,19 @@
 
   "appTitle": "Rustle",
   "statusHeader": "Ready to receive",
+  "initBLEAndWiFi": "Initialise BLE and WiFi",
   "resetConnectionStatus": "Reset WiFi and BLE",
-  "finishedConnectionReset": "Connection reseted, old WiFi active again",
-  "error": "Error:",
-  "vpnActive": "VPN {vpnName} active, if you encounter any problems please try to deactivate it",
+  "finishedConnectionReset": "Connection reset, reconnected to previous WiFi",
+  "error": "Error: {e}",
+  "@error": {
+    "placeholders": {
+      "e": {
+        "type": "String"
+      }
+    }
+  },
+  "errorInit": "Initialisation error",
+  "vpnActive": "VPN {vpnName} is active. If you encounter any issues, try to disable it",
   "@vpnActive": {
     "placeholders": {
       "vpnName": {
@@ -18,6 +27,8 @@
   "scanning": "Scanning",
   "host": "Host",
   "hosting": "Currently hosting",
+  "stopHosting": "Stop hosting",
+  "stoppedHosting": "Stopped hosting",
   "connectedTo": "Connected to: {peerName}",
   "@connectedTo": {
     "placeholders": {
@@ -28,7 +39,19 @@
   },
   "sendFile": "Send file:",
   "isSending": "Sending file",
+  "sendFileTo": "Sending {filename} to {peername}",
+  "@sendFileTo": {
+    "placeholders": {
+      "filename": {
+        "type": "String"
+      },
+      "peername": {
+        "type": "String"
+      }
+    }
+  },
   "finished": "Finished",
+  "finishedTransfer": "Finished transfer",
   "remaining": "Remaining: {seconds}",
   "@remaining": {
     "placeholders": {
@@ -37,16 +60,33 @@
       }
     }
   },
-  "abortTransfer": "Abort transfer",
+  "cancelTransfer": "Cancel transfer",
   "sendAnotherFile": "Send another file",
   "availableDevices": "Available devices",
+  "devicesAvailable": "{number} Devices available",
+  "@devicesAvailable": {
+    "placeholders": {
+      "number": {
+        "type": "int"
+      }
+    }
+  },
   "lookingForDevices": "Looking for nearby devices...",
   "noDevicesFound": "No devices found",
   "connected": "Connected",
-  "readyToSendFile": "Ready to send files",
+  "readyToSendFile": "Ready to send file",
 
   "tooltipsSettings": "Settings",
   "tooltipsDevMode": "Switch to Dev Mode",
-  "tooltipReset": "Reset Connections"
+  "tooltipReset": "Reset Connections",
+
+  "blank": "{b}",
+  "@blank": {
+    "placeholders": {
+      "b": {
+        "type": "String"
+      }
+    }
+  }
 
 }

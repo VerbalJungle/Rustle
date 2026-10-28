@@ -91,7 +91,7 @@ class _UserHomePageState extends State<UserHomePage> {
   DiscoveredPeer? _connectedPeer;
   String? _connectedPeerAddress;
   String? _connectedPeerName;
-  String? _statusMessage;
+  String Function(AppLocalizations l10n)? _statusMessageBuilder;
   String? _activeVpn;
   StreamSubscription<RustEvent>? _eventSub;
   TransferProgress? _activeProgress;
@@ -134,7 +134,7 @@ class _UserHomePageState extends State<UserHomePage> {
       await _scanForRecipients(durationSeconds: 15);
     } catch (e) {
       if (mounted) {
-        setState(() => _statusMessage = 'Initialisierungsfehler: $e');
+        _statusMessageBuilder = (l10n) => l10n.errorInit;
       }
     }
   }
@@ -151,11 +151,11 @@ class _UserHomePageState extends State<UserHomePage> {
           if (event.transferProgress != null) {
             _activeProgress = event.transferProgress;
             if (_activeProgress!.isFinished) {
-              _statusMessage = 'Übertragung abgeschlossen!';
+              _statusMessageBuilder = (l10n) => l10n.finishedTransfer;
             }
           }
           if (event.tcpMessage != null && event.tcpMessage!.startsWith('[Datei empfangen]')) {
-            _statusMessage = event.tcpMessage;
+            _statusMessageBuilder = (_) => event.tcpMessage ?? '';
           }
         });
       },
@@ -194,7 +194,7 @@ class _UserHomePageState extends State<UserHomePage> {
     if (_isScanning || _isConnectingOrSending) return;
     setState(() {
       _isScanning = true;
-      _statusMessage = 'Suche nach Empfängern in der Nähe...';
+      _statusMessageBuilder = (l10n) => l10n.lookingForDevices;
     });
 
     try {
@@ -211,14 +211,14 @@ class _UserHomePageState extends State<UserHomePage> {
 
       setState(() {
         _peers = rustlePeers;
-        _statusMessage = rustlePeers.isEmpty
-            ? 'Keine Empfänger gefunden.'
-            : '${rustlePeers.length} ${rustlePeers.length == 1 ? "Empfänger" : "Empfänger"} verfügbar. Tippe zum Senden!';
+        _statusMessageBuilder = rustlePeers.isEmpty
+            ? _statusMessageBuilder = (l10n) => l10n.noDevicesFound
+            : _statusMessageBuilder = (l10n) => l10n.devicesAvailable(rustlePeers.length);
       });
       await _checkVpn();
     } catch (e) {
       if (mounted) {
-        setState(() => _statusMessage = 'Suche fehlgeschlagen: $e');
+        _statusMessageBuilder = (l10n) => l10n.error('Search failed');
       }
     } finally {
       if (mounted) {
@@ -232,34 +232,34 @@ class _UserHomePageState extends State<UserHomePage> {
     if (_isConnectingOrSending) return;
 
     if (_isReceivingReady) {
-      setState(() => _statusMessage = 'Beende Host-Modus...');
+      _statusMessageBuilder = (l10n) => l10n.stopHosting;
       try {
         await bleStopBroadcast();
         if (mounted) {
           setState(() {
             _isReceivingReady = false;
-            _statusMessage = 'Host-Modus beendet.';
+            _statusMessageBuilder = (l10n) => l10n.stoppedHosting;
           });
         }
       } catch (e) {
         if (mounted) {
-          setState(() => _statusMessage = 'Fehler beim Beenden: $e');
+          _statusMessageBuilder = (l10n) => l10n.error('while cancelling');
         }
       }
     } else {
-      setState(() => _statusMessage = 'Starte Host-Modus (Wi-Fi Direct GO & BLE)...');
+      _statusMessageBuilder = (l10n) => l10n.initBLEAndWiFi;
       try {
         final hostName = Platform.isAndroid ? 'Android' : 'Linux';
         await bleStartBroadcast(deviceName: hostName, isGo: true);
         if (mounted) {
           setState(() {
             _isReceivingReady = true;
-            _statusMessage = 'Host aktiv: Bereit zum Empfangen von Dateien.';
+            _statusMessageBuilder = (l10n) => l10n.hosting;
           });
         }
       } catch (e) {
         if (mounted) {
-          setState(() => _statusMessage = 'Host-Fehler: $e');
+          _statusMessageBuilder = (l10n) => l10n.error(e.toString());
         }
       }
     }
@@ -284,7 +284,7 @@ class _UserHomePageState extends State<UserHomePage> {
     setState(() {
       _isConnectingOrSending = true;
       _activeProgress = null;
-      _statusMessage = 'Verbinde mit $peerCleanName...';
+      _statusMessageBuilder = (l10n) => l10n.connectedTo(peerCleanName);
     });
 
     try {
@@ -302,7 +302,7 @@ class _UserHomePageState extends State<UserHomePage> {
 
       if (!mounted) return;
       setState(() {
-        _statusMessage = 'Sende "$fileName" an $peerCleanName...';
+        _statusMessageBuilder = (l10n) => l10n.sendFileTo(fileName, peerCleanName);
       });
 
       // 3. Dateiübertragung direkt starten
@@ -312,7 +312,7 @@ class _UserHomePageState extends State<UserHomePage> {
       _connectedPeerAddress = null;
       _connectedPeerName = null;
       if (mounted) {
-        setState(() => _statusMessage = 'Übertragung fehlgeschlagen: $e');
+        _statusMessageBuilder = (l10n) => l10n.error('transfer failed');
       }
     } finally {
       if (mounted) {
@@ -337,7 +337,7 @@ class _UserHomePageState extends State<UserHomePage> {
     setState(() {
       _isConnectingOrSending = true;
       _activeProgress = null;
-      _statusMessage = 'Sende "$fileName" an $targetName...';
+      _statusMessageBuilder = (l10n) => l10n.sendFileTo(fileName, targetName);
     });
 
     try {
@@ -345,7 +345,7 @@ class _UserHomePageState extends State<UserHomePage> {
       await startFileTransfer(filePath: filePath);
     } catch (e) {
       if (mounted) {
-        setState(() => _statusMessage = 'Übertragung fehlgeschlagen: $e');
+        _statusMessageBuilder = (l10n) => l10n.error('transfer failed');
       }
     } finally {
       if (mounted) {
@@ -365,7 +365,7 @@ class _UserHomePageState extends State<UserHomePage> {
       setState(() {
         _activeProgress = null;
         _isConnectingOrSending = false;
-        _statusMessage = 'Übertragung abgebrochen.';
+        _statusMessageBuilder = (l10n) => l10n.error('transfer cancelled');
       });
     }
   }
@@ -435,7 +435,7 @@ class _UserHomePageState extends State<UserHomePage> {
             onPressed: (_isConnectingOrSending || _isScanning)
                 ? null
                 : () async {
-                    setState(() => _statusMessage = l10n.resetConnectionStatus);
+                    setState(() => _statusMessageBuilder = (l10n) => l10n.resetConnectionStatus);
                     try {
                       await bleStopBroadcast();
                       if (mounted) {
@@ -446,12 +446,12 @@ class _UserHomePageState extends State<UserHomePage> {
                           _connectedPeerAddress = null;
                           _connectedPeerName = null;
                           _activeProgress = null;
-                          _statusMessage = l10n.finishedConnectionReset;
+                          _statusMessageBuilder = (_) => l10n.finishedConnectionReset;
                         });
                         await _checkVpn();
                       }
                     } catch (e) {
-                      if (mounted) setState(() => _statusMessage = 'Fehler: $e');
+                      if (mounted) setState(() => _statusMessageBuilder = (l10n) => l10n.error(e.toString()));
                     }
                   },
           ),
@@ -572,10 +572,10 @@ class _UserHomePageState extends State<UserHomePage> {
               ],
             ),
 
-            if (_statusMessage != null) ...[
+            if (_statusMessageBuilder != null) ...[
               const SizedBox(height: 12),
               Text(
-                _statusMessage!,
+                _statusMessageBuilder!(l10n),
                 textAlign: TextAlign.center,
                 style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
               ),
@@ -738,7 +738,7 @@ class _UserHomePageState extends State<UserHomePage> {
                             onPressed: _cancelTransfer,
                             icon: const Icon(Icons.close_rounded, size: 18),
                             label: Text(
-                              l10n.abortTransfer,
+                              l10n.cancelTransfer,
                               style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5),
                             ),
                           ),
