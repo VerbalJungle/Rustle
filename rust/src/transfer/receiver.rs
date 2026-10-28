@@ -11,15 +11,17 @@ pub struct FileReceiver;
 
 impl FileReceiver {
     /// Empfängt eine Datei über einen TCP-Stream und speichert sie in `save_directory`.
-    pub fn receive_file<S, P, F>(
+    pub fn receive_file<S, P, F, C>(
         stream: &mut S,
         save_directory: P,
         mut on_progress: F,
+        is_cancelled: C,
     ) -> Result<PathBuf, String>
     where
         S: Read + Write,
         P: AsRef<Path>,
         F: FnMut(&TransferProgress),
+        C: Fn() -> bool,
     {
         let save_dir = save_directory.as_ref();
         if !save_dir.exists() {
@@ -110,6 +112,10 @@ impl FileReceiver {
         let mut buffered_file = BufWriter::with_capacity(2 * 1024 * 1024, file);
 
         while expected_chunk < metadata.total_chunks {
+            if is_cancelled() {
+                return Err("Empfang wurde abgebrochen".into());
+            }
+
             let chunk_header = read_frame_header(&mut buffered_stream)
                 .map_err(|e| format!("Fehler beim Lesen von Chunk-Header {}: {}", expected_chunk, e))?;
 

@@ -4,10 +4,12 @@ import 'dart:ui';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:rustle/dev_mode_page.dart';
 import 'package:rustle/src/rust/api/wifi.dart';
 import 'package:rustle/src/rust/frb_generated.dart';
 import 'package:rustle/src/rust/platform.dart';
 import 'package:rustle/src/rust/transfer/progress.dart';
+import 'package:rustle/l10n/app_localizations.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,14 +17,23 @@ Future<void> main() async {
   runApp(const RustleApp());
 }
 
-class RustleApp extends StatelessWidget {
+class RustleApp extends StatefulWidget {
   const RustleApp({super.key});
+
+  @override
+  State<RustleApp> createState() => _RustleAppState();
+}
+
+class _RustleAppState extends State<RustleApp> {
+  bool _isDevMode = false;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Rustle',
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      onGenerateTitle: (context) => AppLocalizations.of(context)!.appTitle,
       themeMode: ThemeMode.dark,
       darkTheme: ThemeData(
         useMaterial3: true,
@@ -38,7 +49,7 @@ class RustleApp extends StatelessWidget {
           color: const Color(0xFF1E293B),
           elevation: 0,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(14),
             side: const BorderSide(color: Color(0xFF334155), width: 1),
           ),
         ),
@@ -51,30 +62,37 @@ class RustleApp extends StatelessWidget {
         elevatedButtonTheme: ElevatedButtonThemeData(
           style: ElevatedButton.styleFrom(
             elevation: 0,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           ),
         ),
       ),
-      home: const BleDiagnosticPage(),
+      home: _isDevMode
+          ? DevModePage(onExitDevMode: () => setState(() => _isDevMode = false))
+          : UserHomePage(onEnterDevMode: () => setState(() => _isDevMode = true)),
     );
   }
 }
 
-class BleDiagnosticPage extends StatefulWidget {
-  const BleDiagnosticPage({super.key});
+class UserHomePage extends StatefulWidget {
+  final VoidCallback onEnterDevMode;
+
+  const UserHomePage({super.key, required this.onEnterDevMode});
 
   @override
-  State<BleDiagnosticPage> createState() => _BleDiagnosticPageState();
+  State<UserHomePage> createState() => _UserHomePageState();
 }
 
-class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
-  String _status = 'Noch nicht initialisiert';
-  String? _goEventBanner;
-  String? _activeVpn;
-  String? _wifiChannelInfo;
+class _UserHomePageState extends State<UserHomePage> {
   List<DiscoveredPeer> _peers = [];
-  bool _busy = false;
+  bool _isScanning = false;
+  bool _isConnectingOrSending = false;
+  bool _isReceivingReady = false;
+  DiscoveredPeer? _connectedPeer;
+  String? _connectedPeerAddress;
+  String? _connectedPeerName;
+  String? _statusMessage;
+  String? _activeVpn;
   StreamSubscription<RustEvent>? _eventSub;
   TransferProgress? _activeProgress;
   late final AppLifecycleListener _lifecycleListener;
@@ -95,27 +113,29 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
         bleStopBroadcast();
       },
     );
-    _initCore();
+    _initAndStartAutomaticScan();
   }
 
   @override
   void dispose() {
     _eventSub?.cancel();
     _lifecycleListener.dispose();
-    bleStopBroadcast();
     super.dispose();
   }
 
-  Future<void> _initCore() async {
+  Future<void> _initAndStartAutomaticScan() async {
     try {
-      final res = await initCore();
-      setState(() => _status = res);
+      await initCore();
       await _initDownloadDir();
       _listenToRustEvents();
       await _checkVpn();
-      await _refreshWifiChannelInfo();
+
+      // Automatischer 15-Sekunden-BLE-Scan direkt nach dem Öffnen der App
+      await _scanForRecipients(durationSeconds: 15);
     } catch (e) {
-      setState(() => _status = 'Init-Fehler: $e');
+      if (mounted) {
+        setState(() => _statusMessage = 'Initialisierungsfehler: $e');
+      }
     }
   }
 
@@ -124,51 +144,25 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     _eventSub = subscribeEvents().listen(
       (event) {
         if (!mounted) return;
-        bool shouldRefreshChannel = false;
         setState(() {
           if (event.vpnUpdated) {
             _activeVpn = event.activeVpn;
           }
-          if (event.wifiChannelUpdated) {
-            _wifiChannelInfo = event.wifiChannelInfo;
-          }
-          if (event.goHandshake != null && _goEventBanner == null) {
-            _goEventBanner = event.goHandshake;
-            _status = 'GO: Hotspot & TCP-Server (:4242/:4243) laufen!';
-            shouldRefreshChannel = true;
-          }
-          if (event.tcpMessage != null) {
-            _goEventBanner = 'NACHRICHT EMPFANGEN:\n${event.tcpMessage}';
-            _status = 'Letztes Paket erfolgreich verarbeitet!';
-          }
           if (event.transferProgress != null) {
-            if (_wifiChannelInfo == null) {
-              shouldRefreshChannel = true;
-            }
             _activeProgress = event.transferProgress;
+            if (_activeProgress!.isFinished) {
+              _statusMessage = 'Übertragung abgeschlossen!';
+            }
+          }
+          if (event.tcpMessage != null && event.tcpMessage!.startsWith('[Datei empfangen]')) {
+            _statusMessage = event.tcpMessage;
           }
         });
-        if (shouldRefreshChannel) {
-          _refreshWifiChannelInfo();
-        }
       },
       onError: (e) {
-        if (mounted) {
-          setState(() => _status = 'Stream-Fehler: $e');
-        }
+        debugPrint('Event-Stream Fehler: $e');
       },
     );
-  }
-
-  Future<void> _refreshWifiChannelInfo() async {
-    try {
-      final info = await getActiveWifiChannelInfo();
-      if (mounted && info != _wifiChannelInfo) {
-        setState(() => _wifiChannelInfo = info);
-      }
-    } catch (e) {
-      debugPrint('Wi-Fi channel check error: $e');
-    }
   }
 
   Future<void> _checkVpn() async {
@@ -177,9 +171,7 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
       if (mounted && vpn != _activeVpn) {
         setState(() => _activeVpn = vpn);
       }
-    } catch (e) {
-      debugPrint('VPN check error: $e');
-    }
+    } catch (_) {}
   }
 
   Future<void> _initDownloadDir() async {
@@ -197,270 +189,446 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
     }
   }
 
-  Future<void> _advertise(bool isGo) async {
+  /// Scannt per BLE nach verfügbaren Empfängern (beim App-Start 15s, sowie bei Knopfdruck)
+  Future<void> _scanForRecipients({int durationSeconds = 15}) async {
+    if (_isScanning || _isConnectingOrSending) return;
     setState(() {
-      _busy = true;
-      _goEventBanner = null;
-      _activeProgress = null;
-      _status = 'Starte GO (BLE Advertising + Wi-Fi Direct Hotspot Pre-Warming)...';
+      _isScanning = true;
+      _statusMessage = 'Suche nach Empfängern in der Nähe...';
     });
-    try {
-      final res = await bleStartBroadcast(
-        deviceName: isGo ? 'Host' : 'Client',
-        isGo: isGo,
-      );
-      setState(() => _status = res);
-      await _refreshWifiChannelInfo();
-    } catch (e) {
-      setState(() => _status = 'Broadcast-Fehler: $e');
-    } finally {
-      setState(() => _busy = false);
-    }
-  }
 
-  Future<void> _resetConnection() async {
-    setState(() {
-      _busy = true;
-      _goEventBanner = null;
-      _activeProgress = null;
-      _wifiChannelInfo = null;
-      _status = 'Setze Hotspot & BLE zurück (stelle Normal-WLAN wieder her)...';
-    });
     try {
-      final res = await bleStopBroadcast();
-      setState(() {
-        _peers = [];
-        _status = res;
-      });
-      await _checkVpn();
-      await _refreshWifiChannelInfo();
-    } catch (e) {
-      setState(() => _status = 'Reset-Fehler: $e');
-    } finally {
-      setState(() => _busy = false);
-    }
-  }
+      final found = await bleScan(durationSecs: BigInt.from(durationSeconds));
+      if (!mounted) return;
+      // Nur echte Teilnehmer der Rustle-Anwendung anzeigen statt alle nahen BLE GEräte zu empfangen
+      final rustlePeers = found.where((p) {
+        return p.isGo ||
+            p.name.startsWith("R_GO_") ||
+            p.name.startsWith("R_CL_") ||
+            p.name.contains("Rustle") ||
+            p.name == "R_Peer";
+      }).toList();
 
-  Future<void> _scan() async {
-    setState(() {
-      _busy = true;
-      _status = 'Scanne nach Rustle-GO (Smart Early-Exit)...';
-    });
-    try {
-      final found = await bleScan(durationSecs: BigInt.from(3));
       setState(() {
-        _peers = found;
-        _status = 'Scan beendet: ${found.length} Geräte. Tippe auf einen GO zum Verbinden!';
+        _peers = rustlePeers;
+        _statusMessage = rustlePeers.isEmpty
+            ? 'Keine Empfänger gefunden.'
+            : '${rustlePeers.length} ${rustlePeers.length == 1 ? "Empfänger" : "Empfänger"} verfügbar. Tippe zum Senden!';
       });
       await _checkVpn();
     } catch (e) {
-      setState(() => _status = 'Scan-Fehler: $e');
+      if (mounted) {
+        setState(() => _statusMessage = 'Suche fehlgeschlagen: $e');
+      }
     } finally {
-      setState(() => _busy = false);
+      if (mounted) {
+        setState(() => _isScanning = false);
+      }
     }
   }
 
-  Future<void> _startFullHandshake(DiscoveredPeer peer) async {
-    setState(() {
-      _busy = true;
-      _activeProgress = null;
-      _status = '1/3 Lese Zugangsdaten von ${peer.name}...\n2/3 Verbinde Wi-Fi Direct...';
-    });
-    try {
-      final res = await bleHandshakeAndJoinWifi(
-        targetAddress: peer.address,
-        clientName: 'PeerClient',
-      );
-      setState(() => _status = 'ERFOLG!\n$res');
-      await _refreshWifiChannelInfo();
-    } catch (e) {
-      setState(() => _status = 'Handshake-Fehler:\n$e');
-    } finally {
-      setState(() => _busy = false);
+  /// Startet oder beendet den Host-Modus (Wi-Fi Direct Group Owner & BLE-Advertising)
+  Future<void> _toggleHosting() async {
+    if (_isConnectingOrSending) return;
+
+    if (_isReceivingReady) {
+      setState(() => _statusMessage = 'Beende Host-Modus...');
+      try {
+        await bleStopBroadcast();
+        if (mounted) {
+          setState(() {
+            _isReceivingReady = false;
+            _statusMessage = 'Host-Modus beendet.';
+          });
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _statusMessage = 'Fehler beim Beenden: $e');
+        }
+      }
+    } else {
+      setState(() => _statusMessage = 'Starte Host-Modus (Wi-Fi Direct GO & BLE)...');
+      try {
+        final hostName = Platform.isAndroid ? 'Android' : 'Linux';
+        await bleStartBroadcast(deviceName: hostName, isGo: true);
+        if (mounted) {
+          setState(() {
+            _isReceivingReady = true;
+            _statusMessage = 'Host aktiv: Bereit zum Empfangen von Dateien.';
+          });
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _statusMessage = 'Host-Fehler: $e');
+        }
+      }
     }
   }
 
-  Future<void> _pickAndSendFile() async {
+  /// Wird aufgerufen, sobald ein Empfänger in der Liste angetippt wird:
+  /// 1. Öffnet sofort den Dateidialog
+  /// 2. Verbindet sich (falls noch nicht mit diesem Peer verbunden)
+  /// 3. Startet automatisch die Dateiübertragung
+  Future<void> _onRecipientSelected(DiscoveredPeer peer) async {
+    if (_isConnectingOrSending) return;
+
+    // 1. Dateiauswahl-Dialog sofort öffnen
     final result = await FilePicker.platform.pickFiles();
     if (result == null || result.files.isEmpty) return;
 
     final filePath = result.files.single.path;
+    final fileName = result.files.single.name;
     if (filePath == null) return;
 
+    final peerCleanName = _cleanPeerName(peer.name);
     setState(() {
-      _busy = true;
+      _isConnectingOrSending = true;
       _activeProgress = null;
-      _status = 'Starte Transfer von "${result.files.single.name}" (:4243)...';
+      _statusMessage = 'Verbinde mit $peerCleanName...';
     });
 
-    await _refreshWifiChannelInfo();
+    try {
+      // 2. Falls noch nicht mit diesem Empfänger verbunden, Handshake & Wi-Fi Direct aufbauen
+      if (_connectedPeerAddress != peer.address) {
+        await bleHandshakeAndJoinWifi(
+          targetAddress: peer.address,
+          clientName: 'RustleUser',
+        );
+        _connectedPeer = peer;
+        _connectedPeerAddress = peer.address;
+        _connectedPeerName = peerCleanName;
+        _isReceivingReady = false;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _statusMessage = 'Sende "$fileName" an $peerCleanName...';
+      });
+
+      // 3. Dateiübertragung direkt starten
+      await startFileTransfer(filePath: filePath);
+    } catch (e) {
+      _connectedPeer = null;
+      _connectedPeerAddress = null;
+      _connectedPeerName = null;
+      if (mounted) {
+        setState(() => _statusMessage = 'Übertragung fehlgeschlagen: $e');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isConnectingOrSending = false);
+      }
+    }
+  }
+
+  /// Sendet nach einer abgeschlossenen Übertragung oder bei bestehender Verbindung eine weitere Datei
+  Future<void> _sendAnotherFile() async {
+    if (_isConnectingOrSending) return;
+
+    final result = await FilePicker.platform.pickFiles();
+    if (result == null || result.files.isEmpty) return;
+
+    final filePath = result.files.single.path;
+    final fileName = result.files.single.name;
+    if (filePath == null) return;
+
+    final targetName = _connectedPeerName ?? 'verbundenen Empfänger';
+
+    setState(() {
+      _isConnectingOrSending = true;
+      _activeProgress = null;
+      _statusMessage = 'Sende "$fileName" an $targetName...';
+    });
 
     try {
-      final res = await startFileTransfer(filePath: filePath);
-      setState(() => _status = res);
+      // Wi-Fi Direct ist bereits aktiv, direkt Übertragung starten
+      await startFileTransfer(filePath: filePath);
     } catch (e) {
-      setState(() => _status = 'Transfer-Fehler: $e');
+      if (mounted) {
+        setState(() => _statusMessage = 'Übertragung fehlgeschlagen: $e');
+      }
     } finally {
-      setState(() => _busy = false);
+      if (mounted) {
+        setState(() => _isConnectingOrSending = false);
+      }
     }
+  }
+
+  /// Bricht eine laufende Dateiübertragung sofort ab
+  Future<void> _cancelTransfer() async {
+    try {
+      await cancelFileTransfer();
+    } catch (e) {
+      debugPrint('Fehler beim Abbrechen: $e');
+    }
+    if (mounted) {
+      setState(() {
+        _activeProgress = null;
+        _isConnectingOrSending = false;
+        _statusMessage = 'Übertragung abgebrochen.';
+      });
+    }
+  }
+
+  String _cleanPeerName(String rawName) {
+    final cleaned = rawName
+        .replaceFirst(RegExp(r'^R_GO_'), '')
+        .replaceFirst(RegExp(r'^R_CL_'), '')
+        .trim();
+    return cleaned.isEmpty ? rawName : cleaned;
+  }
+
+  String _formatEta(BigInt etaSeconds) {
+    final secs = etaSeconds.toInt();
+    if (secs <= 0) return '< 1s';
+    if (secs < 60) return '${secs}s';
+    final mins = secs ~/ 60;
+    final remSecs = secs % 60;
+    return '${mins}m ${remSecs}s';
   }
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
     return Scaffold(
       appBar: AppBar(
         title: Row(
-          children: const [
-            Icon(Icons.wifi_tethering, color: Color(0xFF38BDF8), size: 24),
-            SizedBox(width: 10),
-            Text('Rustle', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5)),
+          children: [
+            const Icon(Icons.wifi_tethering, color: Color(0xFF38BDF8), size: 24),
+            const SizedBox(width: 10),
+            Text(
+              l10n.appTitle,
+              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5),
+            ),
+            if (_isReceivingReady) ...[
+              const SizedBox(width: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF064E3B),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: const Color(0xFF10B981), width: 0.8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.circle, size: 7, color: Color(0xFF34D399)),
+                    const SizedBox(width: 5),
+                    Text(
+                      l10n.statusHeader,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF6EE7B7),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
         actions: [
           IconButton(
-            tooltip: 'Hotspot & BLE zurücksetzen (Normal-WLAN wiederherstellen)',
+            tooltip: l10n.resetConnectionStatus,
             icon: const Icon(Icons.restore, color: Color(0xFF94A3B8)),
-            onPressed: _busy ? null : _resetConnection,
+            onPressed: (_isConnectingOrSending || _isScanning)
+                ? null
+                : () async {
+                    setState(() => _statusMessage = l10n.resetConnectionStatus);
+                    try {
+                      await bleStopBroadcast();
+                      if (mounted) {
+                        setState(() {
+                          _isReceivingReady = false;
+                          _peers = [];
+                          _connectedPeer = null;
+                          _connectedPeerAddress = null;
+                          _connectedPeerName = null;
+                          _activeProgress = null;
+                          _statusMessage = l10n.finishedConnectionReset;
+                        });
+                        await _checkVpn();
+                      }
+                    } catch (e) {
+                      if (mounted) setState(() => _statusMessage = 'Fehler: $e');
+                    }
+                  },
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.settings, color: Color(0xFF94A3B8)),
+            tooltip: l10n.tooltipsSettings,
+            onSelected: (value) {
+              if (value == 'dev_mode') {
+                widget.onEnterDevMode();
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'dev_mode',
+                child: Row(
+                  children: [
+                    const Icon(Icons.developer_mode, color: Color(0xFF38BDF8), size: 20),
+                    const SizedBox(width: 10),
+                    Text(l10n.tooltipsDevMode),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
       ),
       body: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // VPN-Warnhinweis oben am Bildschirm
+            // Dezenter VPN-Hinweis, falls ein aktives VPN erkannt wurde
             if (_activeVpn != null)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                margin: const EdgeInsets.only(bottom: 16),
                 decoration: BoxDecoration(
                   color: const Color(0xFF451A03),
-                  border: Border.all(color: const Color(0xFFB45309), width: 1.2),
-                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFB45309), width: 1),
+                  borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.warning_amber_rounded, color: Color(0xFFFBBF24), size: 26),
-                    const SizedBox(width: 12),
+                    const Icon(Icons.warning_amber_rounded, color: Color(0xFFFBBF24), size: 22),
+                    const SizedBox(width: 10),
                     Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Aktives VPN erkannt ($_activeVpn)',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: Color(0xFFFDE68A),
-                              fontSize: 13,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          const Text(
-                            'Ein VPN kann den lokalen Wi-Fi Direct Datenverkehr stören. '
-                            'Bei Verbindungsproblemen bitte das VPN vorübergehend pausieren.',
-                            style: TextStyle(fontSize: 11.5, color: Color(0xFFFEF3C7)),
-                          ),
-                        ],
+                      child: Text(
+                        l10n.vpnActive(_activeVpn ?? '---') ,
+                        style: const TextStyle(fontSize: 12, color: Color(0xFFFDE68A)),
                       ),
                     ),
                   ],
                 ),
               ),
 
-            // Obere Steuerungs-Buttons
+            // Dedizierte Steuerungs-Buttons: Scannen & Hosten nebeneinander
             Row(
               children: [
                 Expanded(
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0284C7), // Sky 600
-                      foregroundColor: Colors.white,
-                    ),
-                    onPressed: _busy ? null : () => _advertise(true),
-                    icon: const Icon(Icons.router, size: 18),
-                    label: const Text('1. GO starten'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF4F46E5), // Indigo 600
-                      foregroundColor: Colors.white,
-                    ),
-                    onPressed: _busy ? null : _scan,
-                    icon: const Icon(Icons.search, size: 18),
-                    label: const Text('2. Scannen'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF7F1D1D),
-                    foregroundColor: const Color(0xFFFCA5A5),
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                  ),
-                  onPressed: _busy ? null : _resetConnection,
-                  child: const Icon(Icons.power_settings_new, size: 18),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-
-            // GO Event Banner (Dark Green)
-            if (_goEventBanner != null)
-              Container(
-                padding: const EdgeInsets.all(12),
-                margin: const EdgeInsets.only(bottom: 12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF064E3B), // Deep Emerald
-                  border: Border.all(color: const Color(0xFF059669), width: 1.2),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  _goEventBanner!,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF6EE7B7),
-                    fontSize: 13,
-                  ),
-                ),
-              ),
-
-            // Status Terminal Box
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF020617), // Fast Schwarz Slate 950
-                border: Border.all(color: const Color(0xFF334155), width: 1),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.terminal, color: Color(0xFF64748B), size: 18),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _status,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                        color: Color(0xFF94A3B8),
+                  child: SizedBox(
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0284C7), // Sky 600
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: const Color(0xFF1E293B),
+                        disabledForegroundColor: const Color(0xFF94A3B8),
+                      ),
+                      onPressed: (_isScanning || _isConnectingOrSending)
+                          ? null
+                          : () => _scanForRecipients(durationSeconds: 15),
+                      icon: _isScanning
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFF38BDF8),
+                              ),
+                            )
+                          : const Icon(Icons.radar, size: 20),
+                      label: Text(
+                        _isScanning ? l10n.scanning : l10n.scan,
+                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
                       ),
                     ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SizedBox(
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _isReceivingReady
+                            ? const Color(0xFF065F46) // Emerald 800
+                            : const Color(0xFF4338CA), // Indigo 700
+                        foregroundColor: _isReceivingReady
+                            ? const Color(0xFF6EE7B7)
+                            : Colors.white,
+                        side: _isReceivingReady
+                            ? const BorderSide(color: Color(0xFF10B981), width: 1.2)
+                            : BorderSide.none,
+                      ),
+                      onPressed: _isConnectingOrSending ? null : _toggleHosting,
+                      icon: Icon(
+                        _isReceivingReady ? Icons.check_circle_rounded : Icons.wifi_tethering,
+                        size: 20,
+                        color: _isReceivingReady ? const Color(0xFF34D399) : Colors.white,
+                      ),
+                      label: Text(
+                        _isReceivingReady ? l10n.hosting : l10n.host,
+                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
 
-            // Live Fortschrittsanzeige für Dateiübertragung (Dark Mode)
-            if (_activeProgress != null)
+            if (_statusMessage != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _statusMessage!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
+              ),
+            ],
+
+            // Aktive Verbindung anzeigen (falls verbunden und kein Progress-Card aktiv)
+            if (_connectedPeer != null && _activeProgress == null) ...[
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F2942),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF0284C7), width: 1),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.link, color: Color(0xFF38BDF8), size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        l10n.connectedTo(_connectedPeerName ?? '---'),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                          color: Color(0xFFE2E8F0),
+                        ),
+                      ),
+                    ),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0284C7),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      onPressed: _isConnectingOrSending ? null : _sendAnotherFile,
+                      icon: const Icon(Icons.upload_file, size: 16),
+                      label: Text(l10n.sendFile, style: const TextStyle(fontSize: 12)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+
+            // Vereinfachter Fortschrittsbalken (mit Abbruch & Weiteres Senden)
+            if (_activeProgress != null) ...[
+              const SizedBox(height: 16),
               Card(
-                margin: const EdgeInsets.symmetric(vertical: 8),
                 child: Padding(
-                  padding: const EdgeInsets.all(14),
+                  padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -471,166 +639,196 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                             children: [
                               Icon(
                                 _activeProgress!.isFinished
-                                    ? Icons.check_circle
-                                    : Icons.swap_vert_circle,
+                                    ? Icons.check_circle_rounded
+                                    : Icons.sync_rounded,
                                 color: _activeProgress!.isFinished
                                     ? const Color(0xFF34D399)
                                     : const Color(0xFF38BDF8),
+                                size: 20,
                               ),
                               const SizedBox(width: 8),
                               Text(
                                 _activeProgress!.isFinished
-                                    ? 'Transfer abgeschlossen!'
-                                    : 'Übertragung aktiv...',
-                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                                    ? l10n.sendFile
+                                    : l10n.isSending,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 14,
+                                ),
                               ),
                             ],
                           ),
                           Text(
-                            '${_activeProgress!.progressPercent.toStringAsFixed(1)}%',
+                            '${_activeProgress!.progressPercent.toStringAsFixed(0)}%',
                             style: const TextStyle(
                               fontWeight: FontWeight.bold,
-                              fontSize: 16,
+                              fontSize: 15,
                               color: Color(0xFF38BDF8),
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 12),
                       ClipRRect(
-                        borderRadius: BorderRadius.circular(4),
+                        borderRadius: BorderRadius.circular(6),
                         child: LinearProgressIndicator(
                           value: _activeProgress!.isFinished
                               ? 1.0
                               : (_activeProgress!.progressPercent / 100.0).clamp(0.0, 1.0),
-                          minHeight: 6,
+                          minHeight: 8,
                           backgroundColor: const Color(0xFF334155),
-                          valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF38BDF8)),
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            _activeProgress!.isFinished
+                                ? const Color(0xFF34D399)
+                                : const Color(0xFF38BDF8),
+                          ),
                         ),
                       ),
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 12),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text(
-                            '${(_activeProgress!.bytesTransferred.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB / ${(_activeProgress!.totalBytes.toDouble() / (1024 * 1024)).toStringAsFixed(2)} MB',
-                            style: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
-                          ),
                           Row(
-                            mainAxisSize: MainAxisSize.min,
                             children: [
+                              const Icon(Icons.speed, size: 16, color: Color(0xFF818CF8)),
+                              const SizedBox(width: 5),
                               Text(
                                 '${(_activeProgress!.speedBytesPerSec.toDouble() / (1024 * 1024)).toStringAsFixed(1)} MB/s',
                                 style: const TextStyle(
-                                  fontSize: 12,
+                                  fontSize: 13,
                                   fontWeight: FontWeight.bold,
                                   color: Color(0xFF818CF8),
                                 ),
                               ),
-                              if (_wifiChannelInfo != null && _wifiChannelInfo!.isNotEmpty) ...[
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: _wifiChannelInfo!.startsWith('5')
-                                        ? const Color(0xFF064E3B)
-                                        : const Color(0xFF1E293B),
-                                    borderRadius: BorderRadius.circular(5),
-                                    border: Border.all(
-                                      color: _wifiChannelInfo!.startsWith('5')
-                                          ? const Color(0xFF10B981)
-                                          : const Color(0xFF475569),
-                                      width: 0.8,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    _wifiChannelInfo!,
-                                    style: TextStyle(
-                                      fontSize: 10.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: _wifiChannelInfo!.startsWith('5')
-                                          ? const Color(0xFF6EE7B7)
-                                          : const Color(0xFFCBD5E1),
-                                    ),
-                                  ),
-                                ),
-                              ],
                             ],
                           ),
-                          Text(
-                            'Chunk: ${_activeProgress!.currentChunk}/${_activeProgress!.totalChunks}',
-                            style: const TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
+                          Row(
+                            children: [
+                              const Icon(Icons.schedule, size: 15, color: Color(0xFF94A3B8)),
+                              const SizedBox(width: 5),
+                              Text(
+                                _activeProgress!.isFinished
+                                    ? l10n.finished
+                                    : l10n.remaining(_formatEta(_activeProgress!.etaSeconds)),
+                                style: const TextStyle(
+                                  fontSize: 12.5,
+                                  color: Color(0xFF94A3B8),
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),
+
+                      // Knöpfe für Übertragungsabbruch und nachfolgendes Senden
+                      const SizedBox(height: 14),
+                      if (!_activeProgress!.isFinished) ...[
+                        // Während der Übertragung: Abbruch-Button
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFFF87171),
+                              side: const BorderSide(color: Color(0xFFEF4444), width: 1.2),
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            onPressed: _cancelTransfer,
+                            icon: const Icon(Icons.close_rounded, size: 18),
+                            label: Text(
+                              l10n.abortTransfer,
+                              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5),
+                            ),
+                          ),
+                        ),
+                      ] else ...[
+                        // Nach der Übertragung: "Weitere Datei senden" und "Schließen"
+                        Row(
+                          children: [
+                            Expanded(
+                              flex: 3,
+                              child: ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF0284C7),
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(vertical: 10),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                                onPressed: (_isConnectingOrSending || _connectedPeer == null)
+                                    ? null
+                                    : _sendAnotherFile,
+                                icon: const Icon(Icons.add_to_photos_rounded, size: 18),
+                                label: Text(
+                                  l10n.sendAnotherFile,
+                                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              flex: 2,
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: const Color(0xFF94A3B8),
+                                  side: const BorderSide(color: Color(0xFF475569)),
+                                  padding: const EdgeInsets.symmetric(vertical: 10),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                                onPressed: () {
+                                  setState(() => _activeProgress = null);
+                                },
+                                icon: const Icon(Icons.done_all_rounded, size: 17),
+                                label: Text(
+                                 l10n.finished,
+                                  style: TextStyle(fontSize: 13.5),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ],
                   ),
                 ),
               ),
+            ],
 
-            // Aktions-Buttons: Ping & Datei senden
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.bolt, size: 18),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF92400E), // Warmes Bernstein/Amber
-                      foregroundColor: const Color(0xFFFDE68A),
-                    ),
-                    onPressed: _busy
-                        ? null
-                        : () async {
-                            setState(() {
-                              _busy = true;
-                              _status = 'Sende TCP-Ping über Wi-Fi Direct...';
-                            });
-                            try {
-                              final res = await sendTestPacket(
-                                payload: 'Hallo von Rustle (${DateTime.now().second}s)!',
-                              );
-                              setState(() => _status = res);
-                            } catch (e) {
-                              setState(() => _status = 'TCP-Fehler: $e');
-                            } finally {
-                              setState(() => _busy = false);
-                            }
-                          },
-                    label: const Text('3. TCP-Ping (:4242)'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.upload_file, size: 18),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0F766E), // Teal 700
-                      foregroundColor: const Color(0xFFCCFBF1),
-                    ),
-                    onPressed: _busy ? null : _pickAndSendFile,
-                    label: const Text('4. Datei senden (:4243)'),
-                  ),
-                ),
-              ],
+            const SizedBox(height: 20),
+            Text(
+              l10n.availableDevices,
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Color(0xFFCBD5E1),
+              ),
             ),
-            const SizedBox(height: 16),
-            const Text(
-              'Gefundene Geräte (Tippen zum Verbinden):',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFCBD5E1)),
-            ),
-            const SizedBox(height: 6),
+            const SizedBox(height: 8),
+
+            // Liste der gefundenen Empfänger
             Expanded(
               child: _peers.isEmpty
                   ? Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          Icon(Icons.bluetooth_searching, size: 40, color: Color(0xFF475569)),
-                          SizedBox(height: 8),
+                        children: [
+                          Icon(
+                            _isScanning ? Icons.radar : Icons.devices_other,
+                            size: 46,
+                            color: const Color(0xFF475569),
+                          ),
+                          const SizedBox(height: 12),
                           Text(
-                            'Keine Geräte gefunden.\nTippe auf "2. Scannen", um nach Peers zu suchen.',
+                            _isScanning
+                                ? l10n.lookingForDevices
+                                : l10n.noDevicesFound,
                             textAlign: TextAlign.center,
-                            style: TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                            style: const TextStyle(color: Color(0xFF64748B), fontSize: 13.5),
                           ),
                         ],
                       ),
@@ -638,36 +836,55 @@ class _BleDiagnosticPageState extends State<BleDiagnosticPage> {
                   : ListView.builder(
                       itemCount: _peers.length,
                       itemBuilder: (ctx, i) {
-                        final p = _peers[i];
+                        final peer = _peers[i];
+                        final isConnected = _connectedPeerAddress == peer.address;
                         return Card(
-                          margin: const EdgeInsets.only(bottom: 8),
+                          margin: const EdgeInsets.only(bottom: 10),
                           child: ListTile(
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 6,
+                            ),
                             leading: Container(
-                              padding: const EdgeInsets.all(8),
+                              padding: const EdgeInsets.all(10),
                               decoration: BoxDecoration(
-                                color: p.isGo
+                                color: isConnected
                                     ? const Color(0xFF064E3B)
                                     : const Color(0xFF1E3A8A),
-                                borderRadius: BorderRadius.circular(8),
+                                borderRadius: BorderRadius.circular(10),
                               ),
                               child: Icon(
-                                p.isGo ? Icons.router : Icons.bluetooth,
-                                color: p.isGo
+                                Icons.devices,
+                                color: isConnected
                                     ? const Color(0xFF34D399)
                                     : const Color(0xFF60A5FA),
-                                size: 20,
+                                size: 22,
                               ),
                             ),
                             title: Text(
-                              '${p.name} ${p.isGo ? "(GO)" : ""}',
-                              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                              _cleanPeerName(peer.name),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 15,
+                              ),
                             ),
                             subtitle: Text(
-                              'MAC: ${p.address} | RSSI: ${p.rssi} dBm',
-                              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 11.5),
+                              isConnected
+                                  ? l10n.connected
+                                  : l10n.readyToSendFile,
+                              style: const TextStyle(
+                                color: Color(0xFF94A3B8),
+                                fontSize: 12,
+                              ),
                             ),
-                            trailing: const Icon(Icons.wifi_tethering, color: Color(0xFF38BDF8), size: 20),
-                            onTap: _busy ? null : () => _startFullHandshake(p),
+                            trailing: const Icon(
+                              Icons.send_rounded,
+                              color: Color(0xFF38BDF8),
+                              size: 20,
+                            ),
+                            onTap: _isConnectingOrSending
+                                ? null
+                                : () => _onRecipientSelected(peer),
                           ),
                         );
                       },

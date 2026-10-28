@@ -370,10 +370,12 @@ object NativeWifiBridge {
             if (!hasManufacturerData) {
                 // Client-Modus oder noch keine Creds: Service UUID ins Haupt-Werbepaket
                 dataBuilder.addServiceUuid(serviceParcelUuid)
-            } else {
-                // GO-Modus mit Creds: Service UUID in Scan Response
-                scanResponseBuilder.addServiceUuid(serviceParcelUuid)
             }
+            // CRITICAL BLE LIMIT CHECK:
+            // Wenn hasManufacturerData == true ist, DARF KEINE 128-Bit Service UUID
+            // (18 Bytes) in scanResponseBuilder stehen, da Device Name + Service UUID
+            // das 31-Byte BLE-Limit überschreiten und sofort zu ADVERTISE_FAILED_DATA_TOO_LARGE führen!
+            // scanResponseBuilder enthält daher ausschließlich den Device Name.
 
             val data = dataBuilder.build()
             val scanResponse = scanResponseBuilder.build()
@@ -393,6 +395,19 @@ object NativeWifiBridge {
                         else -> "CODE_$errorCode"
                     }
                     println("Android BLE Advertising FEHLGESCHLAGEN: $reason ($errorCode)")
+
+                    if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) {
+                        println("Android BLE Advertising: Starte Fallback ohne Device Name in Scan Response...")
+                        val fallbackScan = AdvertiseData.Builder().setIncludeDeviceName(false).build()
+                        advertiser?.startAdvertising(settings, data, fallbackScan, object : AdvertiseCallback() {
+                            override fun onStartSuccess(s: AdvertiseSettings?) {
+                                println("Android BLE Advertising Fallback erfolgreich aktiv!")
+                            }
+                            override fun onStartFailure(err: Int) {
+                                println("Android BLE Advertising Fallback ebenfalls fehlgeschlagen: $err")
+                            }
+                        })
+                    }
                 }
             }
 
@@ -472,15 +487,20 @@ object NativeWifiBridge {
                 }
 
                 val hasUuid = scanRec?.serviceUuids?.contains(serviceParcelUuid) == true
-                if (rawName.startsWith("R_GO_") || hasUuid || hasOurManData) {
-                    foundRustleGo = true
+                val isRustlePeer = hasOurManData || hasUuid || rawName.startsWith("R_GO_") || rawName.startsWith("R_CL_")
+
+                // Nur echte Rustle-Teilnehmer erfassen – alle anderen BLE-Geräte (Kopfhörer, TVs, Beacons) ignorieren
+                if (!isRustlePeer) {
+                    return
                 }
+
+                foundRustleGo = true
 
                 val finalName = when {
                     rawName.isNotEmpty() -> rawName
                     hasOurManData -> "R_GO_Peer"
                     hasUuid -> "R_Peer"
-                    else -> "<Unbekannt>"
+                    else -> "Rustle_Peer"
                 }
 
                 found[dev.address] = "${dev.address}|$finalName|$rssi"
@@ -780,12 +800,27 @@ object NativeWifiBridge {
                             .setIncludeDeviceName(false)
                             .addManufacturerData(RUSTLE_COMPANY_ID, packed)
                             .build()
+                        // WICHTIG: KEINE Service UUID in ScanResponse, da sonst > 31 Bytes!
                         val scanResponse = AdvertiseData.Builder()
                             .setIncludeDeviceName(true)
-                            .addServiceUuid(serviceParcelUuid)
                             .build()
-                        adv.startAdvertising(settings, data, scanResponse, advCallback)
-                        println("Android BLE Advertising mit Manufacturer Data aktualisiert: $creds")
+
+                        val updateCallback = object : AdvertiseCallback() {
+                            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                                println("Android BLE Advertising mit Manufacturer Data erfolgreich aktualisiert: $creds")
+                            }
+
+                            override fun onStartFailure(errorCode: Int) {
+                                println("Android BLE Advertising Aktualisierung fehlgeschlagen: $errorCode")
+                                if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) {
+                                    println("BLE Advertising Update: Fallback ohne Device Name...")
+                                    val fallbackScan = AdvertiseData.Builder().setIncludeDeviceName(false).build()
+                                    adv.startAdvertising(settings, data, fallbackScan, advCallback)
+                                }
+                            }
+                        }
+                        advCallback = updateCallback
+                        adv.startAdvertising(settings, data, scanResponse, updateCallback)
                     }
                 }
             }

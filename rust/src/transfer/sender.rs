@@ -11,16 +11,18 @@ pub struct FileSender;
 
 impl FileSender {
     /// Sendet eine Datei über einen beliebigen Read+Write-Stream (z. B. TCP-Stream)
-    pub fn send_file<S, P, F>(
+    pub fn send_file<S, P, F, C>(
         stream: &mut S,
         file_path: P,
         file_id: String,
         mut on_progress: F,
+        is_cancelled: C,
     ) -> Result<u64, String>
     where
         S: Read + Write,
         P: AsRef<Path>,
         F: FnMut(&TransferProgress),
+        C: Fn() -> bool,
     {
         let path = file_path.as_ref();
         let mut file = File::open(path)
@@ -39,20 +41,22 @@ impl FileSender {
 
         let metadata = FileMetadata::from_file_info(file_id, file_name, file_size, DEFAULT_CHUNK_SIZE);
 
-        Self::send_stream(stream, &mut file, metadata, &mut on_progress)
+        Self::send_stream(stream, &mut file, metadata, &mut on_progress, is_cancelled)
     }
 
     /// Universeller Sender für beliebige Streams & Reader (ermöglicht 100% Mocking & Tests ohne Dateisystem)
-    pub fn send_stream<S, R, F>(
+    pub fn send_stream<S, R, F, C>(
         stream: &mut S,
         reader: &mut R,
         metadata: FileMetadata,
         on_progress: &mut F,
+        is_cancelled: C,
     ) -> Result<u64, String>
     where
         S: Read + Write,
         R: Read + Seek,
         F: FnMut(&TransferProgress),
+        C: Fn() -> bool,
     {
         // 1. Handshake: Metadaten als JSON im ersten Frame senden und direkt flushen
         let meta_json = serde_json::to_vec(&metadata)
@@ -99,6 +103,10 @@ impl FileSender {
         let mut buffered_writer = BufWriter::with_capacity(2 * 1024 * 1024, stream);
 
         while current_chunk < metadata.total_chunks {
+            if is_cancelled() {
+                return Err("Übertragung wurde abgebrochen".into());
+            }
+
             let bytes_read = buffered_reader
                 .read(&mut buffer)
                 .map_err(|e| format!("Fehler beim Lesen von Chunk {}: {}", current_chunk, e))?;

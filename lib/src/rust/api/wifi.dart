@@ -69,6 +69,10 @@ Future<void> setDownloadDirectory({required String dirPath}) =>
 Future<TransferProgress?> pollTransferProgress() =>
     RustLib.instance.api.crateApiWifiPollTransferProgress();
 
+/// Bricht eine laufende Dateiübertragung (Senden oder Empfangen) sofort ab
+Future<void> cancelFileTransfer() =>
+    RustLib.instance.api.crateApiWifiCancelFileTransfer();
+
 /// Startet das Streaming einer Datei an den verbundenen Peer im Hintergrund
 Future<String> startFileTransfer({required String filePath}) =>
     RustLib.instance.api.crateApiWifiStartFileTransfer(filePath: filePath);

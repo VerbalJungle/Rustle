@@ -6,6 +6,7 @@ pub use crate::transfer::TransferProgress;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -104,6 +105,7 @@ static ACTIVE_GO_CREDS: Mutex<Option<String>> = Mutex::new(None);
 static DOWNLOAD_DIRECTORY: Mutex<Option<String>> = Mutex::new(None);
 static ACTIVE_TRANSFER_PROGRESS: Mutex<Option<TransferProgress>> = Mutex::new(None);
 static TRANSFER_SERVER_RUNNING: Mutex<bool> = Mutex::new(false);
+static TRANSFER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 pub const RUSTLE_TCP_PORT: u16 = 4242;
 pub const RUSTLE_TRANSFER_PORT: u16 = 4243;
@@ -247,6 +249,7 @@ pub fn ble_stop_broadcast() -> Result<String, String> {
     *PEER_IP.lock().unwrap() = None;
     *ACTIVE_GO_CREDS.lock().unwrap() = None;
     OUTGOING_TCP_QUEUE.lock().unwrap().clear();
+    TRANSFER_CANCELLED.store(true, Ordering::SeqCst);
     if let Ok(mut p) = ACTIVE_TRANSFER_PROGRESS.lock() {
         *p = None;
     }
@@ -487,6 +490,16 @@ pub fn poll_transfer_progress() -> Result<Option<TransferProgress>, String> {
     Ok(lock.clone())
 }
 
+/// Bricht eine laufende Dateiübertragung (Senden oder Empfangen) sofort ab
+pub fn cancel_file_transfer() -> Result<(), String> {
+    TRANSFER_CANCELLED.store(true, Ordering::SeqCst);
+    if let Ok(mut lock) = ACTIVE_TRANSFER_PROGRESS.lock() {
+        *lock = None;
+    }
+    println!("[RUST TRANSFER] Übertragung wurde vom Nutzer abgebrochen");
+    Ok(())
+}
+
 /// Startet das Streaming einer Datei an den verbundenen Peer im Hintergrund
 pub fn start_file_transfer(file_path: String) -> Result<String, String> {
     let target_ip = {
@@ -504,6 +517,7 @@ pub fn start_file_transfer(file_path: String) -> Result<String, String> {
 
     ensure_transfer_server_running();
 
+    TRANSFER_CANCELLED.store(false, Ordering::SeqCst);
     let target = target_ip.clone();
     let path_clone = file_path.clone();
 
@@ -553,6 +567,7 @@ pub fn start_file_transfer(file_path: String) -> Result<String, String> {
                 }
                 emit_event(RustEvent::from_transfer_progress(progress.clone()));
             },
+            || TRANSFER_CANCELLED.load(Ordering::SeqCst),
         );
 
         match res {
@@ -706,6 +721,7 @@ fn ensure_transfer_server_running() {
                     emit_event(RustEvent::from_wifi_channel_info(ch_info));
                 }
 
+                TRANSFER_CANCELLED.store(false, Ordering::SeqCst);
                 let res = crate::transfer::FileReceiver::receive_file(
                     &mut s,
                     &save_dir,
@@ -715,6 +731,7 @@ fn ensure_transfer_server_running() {
                         }
                         emit_event(RustEvent::from_transfer_progress(progress.clone()));
                     },
+                    || TRANSFER_CANCELLED.load(Ordering::SeqCst),
                 );
 
                 match res {

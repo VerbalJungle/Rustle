@@ -7,7 +7,7 @@ use bluer::gatt::local::{
     Application, ApplicationHandle, Characteristic, CharacteristicRead, CharacteristicWrite,
     CharacteristicWriteMethod, Service,
 };
-use bluer::{Address, AddressType, Uuid};
+use bluer::{Address, Uuid};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -906,8 +906,12 @@ impl BleDevice for LinuxBleManager {
                                     }
                                 }
 
-                                if name.starts_with("R_GO_")
-                                    || uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID))
+                                // Nur wenn Manufacturer Data mit Credentials vorliegt, sofort abbrechen.
+                                // Falls nur Name/UUID vorliegt (z. B. alter BlueZ-Cache), mindestens 1.8s scannen,
+                                // damit BlueZ die neuen Manufacturer Data Werbepakete empfangen kann!
+                                if step >= 12
+                                    && (name.starts_with("R_GO_")
+                                        || uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID)))
                                 {
                                     found_go = true;
                                     break;
@@ -930,8 +934,7 @@ impl BleDevice for LinuxBleManager {
 
             for addr in device_addresses {
                 if let Ok(dev) = adapter.device(addr) {
-                    let addr_type = dev.address_type().await.ok();
-                    let name = dev.name().await.ok().flatten().unwrap_or_default();
+                                        let name = dev.name().await.ok().flatten().unwrap_or_default();
                     let rssi = dev.rssi().await.ok().flatten().unwrap_or(0);
                     let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
                     let man_data = dev.manufacturer_data().await.ok().flatten().unwrap_or_default();
@@ -951,11 +954,8 @@ impl BleDevice for LinuxBleManager {
                     let has_our_uuid = uuids.contains(&Uuid::from_u128(RUSTLE_SERVICE_UUID));
                     let is_rustle_name = name.starts_with("R_GO_") || name.starts_with("R_CL_");
 
-                    if has_our_uuid
-                        || has_our_man_data
-                        || is_rustle_name
-                        || (!name.is_empty() && addr_type != Some(AddressType::BrEdr))
-                    {
+                    // Nur echte Rustle-Teilnehmer (unsere Service-UUID, 0x5255 Manufacturer Data oder R_GO_/R_CL_ Namens-Präfix) erfassen
+                    if has_our_uuid || has_our_man_data || is_rustle_name {
                         let is_go = has_our_man_data || name.starts_with("R_GO_");
                         let display_name = if !name.is_empty() {
                             name
@@ -964,7 +964,7 @@ impl BleDevice for LinuxBleManager {
                         } else if has_our_uuid {
                             "R_Peer".into()
                         } else {
-                            "<Unbekannt>".into()
+                            "Rustle_Peer".into()
                         };
                         peers.push(DiscoveredPeer {
                             address: addr.to_string(),
@@ -1015,11 +1015,26 @@ impl BleDevice for LinuxBleManager {
         let addr =
             Address::from_str(target_address).map_err(|e| format!("Ungültige MAC: {}", e))?;
         let payload = format!("CONNECT;{}", client_name);
+        let target_address_str = target_address.to_string();
 
         self.rt.block_on(async move {
             let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
             let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
             let mut device = adapter.device(addr).map_err(|e| e.to_string())?;
+
+            // 1.5 DIREKT-CHECK: Hat BlueZ inzwischen Manufacturer Data für dieses Device empfangen?
+            if let Ok(Some(man_data)) = device.manufacturer_data().await {
+                if let Some(bytes) = man_data.get(&RUSTLE_COMPANY_ID) {
+                    if let Some(creds) = unpack_wifi_credentials(bytes) {
+                        println!(
+                            "[LINUX BLE] Connectionless Zugangsdaten direkt aus BlueZ Device Manufacturer Data gelesen: {}",
+                            creds
+                        );
+                        cache_go_credentials(&target_address_str, creds.clone());
+                        return Ok(creds);
+                    }
+                }
+            }
 
             if !device.is_connected().await.unwrap_or(false) {
                 if let Err(first_err) = device.connect().await {

@@ -1348,6 +1348,7 @@ dependencies = [
  "flutter_rust_bridge",
  "futures-lite",
  "jni",
+ "log",
  "ndk-context",
  "serde",
  "serde_json",

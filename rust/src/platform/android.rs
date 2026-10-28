@@ -134,7 +134,8 @@ impl BleDevice for AndroidBleManager {
         let vm = JVM.get().ok_or("JavaVM fehlt")?;
         let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
         let role_prefix = if is_go { "R_GO_" } else { "R_CL_" };
-        let full_name = format!("{}{}", role_prefix, device_name);
+        let short_name: String = device_name.chars().take(8).collect();
+        let full_name = format!("{}{}", role_prefix, short_name);
         let j_name = env.new_string(&full_name).map_err(|e| e.to_string())?;
 
         call_kotlin_bridge(

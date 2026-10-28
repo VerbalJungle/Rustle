@@ -1,0 +1,52 @@
+{
+  "@@locale": "en",
+
+  "appTitle": "Rustle",
+  "statusHeader": "Ready to receive",
+  "resetConnectionStatus": "Reset WiFi and BLE",
+  "finishedConnectionReset": "Connection reseted, old WiFi active again",
+  "error": "Error:",
+  "vpnActive": "VPN {vpnName} active, if you encounter any problems please try to deactivate it",
+  "@vpnActive": {
+    "placeholders": {
+      "vpnName": {
+        "type": "String"
+      }
+    }
+  },
+  "scan": "Scan",
+  "scanning": "Scanning",
+  "host": "Host",
+  "hosting": "Currently hosting",
+  "connectedTo": "Connected to: {peerName}",
+  "@connectedTo": {
+    "placeholders": {
+      "peerName": {
+        "type": "String"
+      }
+    }
+  },
+  "sendFile": "Send file:",
+  "isSending": "Sending file",
+  "finished": "Finished",
+  "remaining": "Remaining: {seconds}",
+  "@remaining": {
+    "placeholders": {
+      "seconds": {
+        "type": "String"
+      }
+    }
+  },
+  "abortTransfer": "Abort transfer",
+  "sendAnotherFile": "Send another file",
+  "availableDevices": "Available devices",
+  "lookingForDevices": "Looking for nearby devices...",
+  "noDevicesFound": "No devices found",
+  "connected": "Connected",
+  "readyToSendFile": "Ready to send files",
+
+  "tooltipsSettings": "Settings",
+  "tooltipsDevMode": "Switch to Dev Mode",
+  "tooltipReset": "Reset Connections"
+
+}
